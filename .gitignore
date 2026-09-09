@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.sqlite
+*.sqlite-journal
+builds.jsonl
+dashboard-*.html
+.coverage

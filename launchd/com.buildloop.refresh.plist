@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Optional hourly refresh. Running `buildloop refresh` by hand is a perfectly
+  good v1 — this exists so you can stop thinking about it.
+
+  Install:
+    sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+        launchd/com.buildloop.refresh.plist > ~/Library/LaunchAgents/com.buildloop.refresh.plist
+    launchctl load ~/Library/LaunchAgents/com.buildloop.refresh.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.buildloop.refresh.plist
+    rm ~/Library/LaunchAgents/com.buildloop.refresh.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.buildloop.refresh</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/bin/buildloop</string>
+    <string>refresh</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <!-- gh lives in Homebrew; launchd's default PATH does not include it. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.buildloop/refresh.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.buildloop/refresh.log</string>
+</dict>
+</plist>

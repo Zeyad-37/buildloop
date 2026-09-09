@@ -1,0 +1,23 @@
+{
+  "total_count": 1,
+  "jobs": [
+    {
+      "id": 9001,
+      "run_id": 101,
+      "name": "build",
+      "conclusion": "failure",
+      "started_at": "2026-09-01T10:00:35Z",
+      "completed_at": "2026-09-01T10:12:05Z",
+      "labels": ["ubuntu-latest"],
+      "runner_name": "GitHub Actions 5",
+      "steps": [
+        {"number": 1, "name": "Set up job", "conclusion": "success",
+         "started_at": "2026-09-01T10:00:35Z", "completed_at": "2026-09-01T10:00:40Z"},
+        {"number": 2, "name": "Gradle test", "conclusion": "failure",
+         "started_at": "2026-09-01T10:00:40Z", "completed_at": "2026-09-01T10:12:00Z"},
+        {"number": 3, "name": "No timing", "conclusion": "skipped",
+         "started_at": null, "completed_at": null}
+      ]
+    }
+  ]
+}

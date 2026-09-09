@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Assert zero third-party dependencies
+        run: |
+          # buildloop is stdlib-only by design (RFC T-055 §4.1). If this ever
+          # needs a requirements file, that is a design change, not a fix.
+          test ! -e requirements.txt
+          test ! -e pyproject.toml
+          test ! -e setup.py
+
+      - name: Compile
+        run: python -m compileall -q buildloop tests
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
