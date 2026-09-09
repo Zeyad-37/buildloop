@@ -2,7 +2,9 @@
 #
 # Adding a project is three lines. `github_repo` enables the CI collector,
 # `gradle_root` enables the local Gradle collector; set either or both.
-# `gradle_root` must match `rootProject.name` in the project's settings.gradle.kts.
+# `gradle_root` must match `rootProject.name` in that project's
+# settings.gradle.kts — it is what the init script matches against, so a
+# mismatch means silently no local data.
 
 [[project]]
 name        = "steady"
@@ -11,5 +13,5 @@ gradle_root = "Steady"
 
 [[project]]
 name        = "pagecurl"
-github_repo = "Zeyad-37/pagecurl"
-gradle_root = "pagecurl"
+github_repo = "Zeyad-37/pagecurl-cmp"
+gradle_root = "pagecurl-cmp"
