@@ -112,6 +112,19 @@ class TestIdempotency(unittest.TestCase):
         self.assertEqual(row["jobs_synced"], 1)
 
 
+class TestCutoffFormat(unittest.TestCase):
+    def test_cutoff_matches_githubs_timestamp_shape(self):
+        # Must not carry microseconds or a +00:00 offset, or boundary rows
+        # start depending on lexicographic accidents against "...:00Z".
+        cutoff = ci._iso_days_ago(90)
+        self.assertRegex(cutoff, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_cutoff_sorts_correctly_against_a_github_timestamp(self):
+        recent = ci._iso_days_ago(1)
+        old = ci._iso_days_ago(365)
+        self.assertLess(old, recent)
+
+
 class FakeGh:
     """Stands in for `gh api`, recording the windows it was asked for."""
 

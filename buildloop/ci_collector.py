@@ -30,6 +30,11 @@ from .config import Project
 SEARCH_CAP = 1000
 PAGE_SIZE = 100
 
+#: How far back to keep re-checking a run that never reached a terminal state.
+#: Beyond this it was abandoned, cancelled without notice, or deleted — and
+#: re-requesting it on every refresh forever is pure waste.
+STALE_RUN_DAYS = 7
+
 #: Rolling window for jobs + steps. Steps ride along inside the jobs response
 #: at no extra request cost, so bounding jobs bounds steps by construction.
 JOB_WINDOW_DAYS = 90
@@ -78,6 +83,16 @@ def delta_ms(start: str | None, end: str | None) -> int | None:
 
 def _today() -> date:
     return datetime.now(timezone.utc).date()
+
+
+def _iso_days_ago(days: int) -> str:
+    """A cutoff in the same shape GitHub uses, so string comparison is exact.
+
+    `datetime.isoformat()` would emit microseconds and a `+00:00` offset, which
+    sorts differently against GitHub's `...:00Z` and makes boundary rows
+    depend on lexicographic accidents.
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --- run mapping ------------------------------------------------------------
@@ -235,10 +250,11 @@ def collect(conn: sqlite3.Connection, project: Project, *, log=print,
             log(f"    {stats.runs} runs…")
             conn.commit()
 
-    # Re-fetch anything still non-terminal so its conclusion and duration land.
+    # Re-fetch anything recent and still non-terminal so its conclusion and
+    # duration land.
     for row in conn.execute(
-        "SELECT run_id FROM ci_run WHERE project = ? AND status IS NOT ?",
-        (project.name, TERMINAL_STATUS),
+        "SELECT run_id FROM ci_run WHERE project = ? AND status IS NOT ? AND created_at >= ?",
+        (project.name, TERMINAL_STATUS, _iso_days_ago(STALE_RUN_DAYS)),
     ).fetchall():
         try:
             stats.requests += 1
@@ -257,7 +273,7 @@ def collect(conn: sqlite3.Connection, project: Project, *, log=print,
 
 
 def _collect_jobs(conn, project: Project, stats: CollectStats, log, window_days: int) -> None:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    cutoff = _iso_days_ago(window_days)
     pending = conn.execute(
         """
         SELECT run_id FROM ci_run
