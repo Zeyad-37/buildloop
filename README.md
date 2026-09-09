@@ -76,6 +76,12 @@ Two things it is built never to do:
 * **Cost anything.** Measured on a 60-module KMP project: no detectable
   overhead against run-to-run noise (see `docs/verification.md`).
 
+It is a single `BuildService` that listens for task-completion events and
+writes its row when Gradle closes it at the end of the build. The documented
+`FlowAction` hook looked like the right answer and silently double-counts every
+build from an init script — `docs/verification.md` has the details, because it
+is the kind of bug that produces no error at all.
+
 Opt out for one build with `BUILDLOOP_DISABLE=1 ./gradlew …`, or permanently
 with `buildloop uninstall`.
 

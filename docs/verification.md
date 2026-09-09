@@ -29,6 +29,7 @@ Steady (60-module KMP, configuration cache + build cache + parallel on).
 | 5 | `--no-build-cache` | Row written, `from_cache: 0` | pass |
 | 6 | Failing build | Row written, `outcome: "failed"` | pass |
 | 7 | Interrupted build (Ctrl-C) | No corrupt JSONL row; ingest tolerates truncation | pass (ingest covered by `test_gradle_ingest.py`) |
+| 7b | Any build | **Exactly one row**, never a duplicate | pass — see "The FlowAction trap" below |
 | 8 | Untracked project | No-op, no row, zero overhead | pass |
 | 9 | Included build (`build-logic`) | No row — the gate matches only the outer `rootProject.name` | pass |
 | 10 | IDE sync of a tracked project | Row written, `tasks` empty, stored as `(sync)` | **not yet verified** — needs a real Android Studio sync |
@@ -46,17 +47,54 @@ each build sees the other's id. See below.
 Measured on Steady, `./gradlew help`, configuration cache warm, five
 consecutive runs each way:
 
-| | runs (ms) | mean |
+Interleaved A/B/A/B, five consecutive runs per block:
+
+| block | with | without |
 |---|---|---|
-| without init script | 398, 406, 442, 448, 438 | 426 ms |
-| with init script | 430, 408, 406, 398 | 410 ms |
+| 1 | 649 ms | 661 ms |
+| 2 | 749 ms | 731 ms |
 
-Indistinguishable from run-to-run noise. **Gate passed.**
+The differences are smaller than the drift between blocks. Indistinguishable
+from run-to-run noise. **Gate passed.**
 
-(The first "with" run is excluded: alternating between two `-I` arguments
-changes the configuration-cache key, and Gradle keeps one entry per key by
-default, so each switch forces a miss. That is an artefact of the measurement,
-not of the script.)
+(Alternating `-I` arguments changes the configuration-cache key, and Gradle
+keeps one entry per key by default, so the first run after each switch is a
+forced miss. Warm both entries before measuring.)
+
+## The FlowAction trap
+
+`FlowScope`/`FlowProviders` is the documented configuration-cache-compatible
+build-completion hook, and it gives an authoritative build-failure signal. It
+was the obvious choice, it is what the RFC specified, and it is wrong here.
+
+A `FlowAction` that reaches the task-outcome `BuildService` via
+`@ServiceReference` cannot be serialised into the configuration cache when both
+classes are declared in a `.gradle.kts` init script:
+
+```
+Could not load the value of field `__stats__` of `...$Params_Decorated`
+> Cannot set the value of a property of type BuildLoopCollector loaded with
+  VisitableURLClassLoader(...buildloop.init.gradle.kts...) using a provider of
+  type BuildLoopCollector loaded with VisitableURLClassLoader(same)
+```
+
+Gradle's advice in that message — "use `@ServiceReference`" — was already being
+followed; the init-script classloader case is simply not supported. What made
+it dangerous is the *recovery*: rather than failing, Gradle configures a second
+time, leaving two action instances that each write a row. Every build was
+double-counted, half the rows with null task counts, and nothing in the build
+output said so. It was found by counting rows, not by an error.
+
+The fix is to drop the `FlowAction` and write from the `BuildService`'s own
+`AutoCloseable.close()`, which Gradle calls at the end of the build. One class,
+no cross-bean reference to serialise. The build-failure signal is recovered
+from `TaskFailureResult` instead, which is actually more informative — the
+FlowAction version recorded a failing build with `task_count: 0`, because it
+fired without the task stats attached.
+
+The one case this cannot see is a build that fails during *configuration*: no
+tasks run, the service is never instantiated, and no row is written. That is
+the right outcome — there is no build duration to record.
 
 ## Config-cache detection, and why it is a heuristic
 

@@ -8,33 +8,47 @@
  * Two properties this script must have, or it becomes a liability:
  *
  *   1. It early-returns for unknown projects. init.d scripts run for EVERY
- *      Gradle build on the machine — other projects, and every IDE sync. The
- *      gate keeps the dataset clean and keeps overhead at zero for untracked
- *      work.
+ *      Gradle build on the machine — other projects, included builds such as
+ *      build-logic, and every IDE sync. The gate keeps the dataset clean and
+ *      keeps overhead at zero for untracked work.
  *   2. It never fails a build. Every collection path is wrapped; any error
  *      degrades to a debug log. A metrics tool that breaks the build has
  *      negative value.
  *
- * Configuration-cache compatible by construction: a BuildService receiving
- * TaskFinishEvents via BuildEventsListenerRegistry, plus a FlowAction for the
- * build-completion callback. `buildFinished` / BuildListener are NOT usable.
+ * Configuration-cache compatible by construction: a single BuildService
+ * receiving TaskFinishEvents via BuildEventsListenerRegistry, which writes its
+ * row when Gradle closes it at the end of the build. `buildFinished` and
+ * BuildListener are NOT usable under the configuration cache.
+ *
+ * WHY NOT A FlowAction. FlowScope/FlowProviders is the documented
+ * build-completion hook and gives an authoritative failure signal, so it was
+ * the obvious choice. It does not survive contact with an init script: a
+ * FlowAction that reaches the task-outcome BuildService through
+ * `@ServiceReference` cannot be serialised into the configuration cache when
+ * both classes are declared in a `.gradle.kts` init script —
+ *
+ *   Cannot set the value of a property of type BuildLoopCollector loaded with
+ *   VisitableURLClassLoader(...buildloop.init.gradle.kts...) using a provider
+ *   of type BuildLoopCollector loaded with VisitableURLClassLoader(same)
+ *
+ * — and Gradle recovers by configuring twice, leaving TWO action instances
+ * that each write a row: one with task counts and one with nulls. Every build
+ * double-counted, half the rows empty. `AutoCloseable.close()` on the service
+ * itself is a build-completion hook with no cross-bean reference to serialise,
+ * so it sidesteps the whole problem. The cost is the failure signal, which is
+ * recovered from task results instead (see `anyTaskFailed`).
  */
 
 import org.gradle.api.Plugin
-import org.gradle.api.flow.FlowAction
-import org.gradle.api.flow.FlowParameters
-import org.gradle.api.flow.FlowProviders
-import org.gradle.api.flow.FlowScope
 import org.gradle.api.initialization.Settings
 import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.services.BuildService
 import org.gradle.api.services.BuildServiceParameters
-import org.gradle.api.services.ServiceReference
-import org.gradle.api.tasks.Input
 import org.gradle.build.event.BuildEventsListenerRegistry
 import org.gradle.tooling.events.FinishEvent
 import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
 import org.gradle.tooling.events.task.TaskFinishEvent
 import org.gradle.tooling.events.task.TaskSkippedResult
 import org.gradle.tooling.events.task.TaskSuccessResult
@@ -44,99 +58,91 @@ import java.lang.management.ManagementFactory
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 
 // ---------------------------------------------------------------------------
-// Task outcome accumulator
+// Collector
 // ---------------------------------------------------------------------------
 
-/**
- * Counts task outcomes for one build. `TaskSuccessResult` exposes `isFromCache`
- * and `isUpToDate`, which is where cache effectiveness comes from.
- *
- * The service is instantiated once per build, so its construction timestamp is
- * a usable proxy for the start of work — needed because on a configuration
- * cache HIT the configuration-time timestamp is a stale cached value.
- */
-abstract class BuildLoopTaskStats :
-    BuildService<BuildServiceParameters.None>, OperationCompletionListener {
+abstract class BuildLoopCollector :
+    BuildService<BuildLoopCollector.Params>, OperationCompletionListener, AutoCloseable {
 
-    val serviceStartMs: Long = System.currentTimeMillis()
+    interface Params : BuildServiceParameters {
+        val projectName: Property<String>
+        val tasks: ListProperty<String>
+        val configId: Property<String>
+        val buildStartMs: Property<Long>
+        val configCacheMode: Property<String>
+        val gradleVersion: Property<String>
+        val homeDir: Property<String>
+    }
 
-    /** Earliest task start / latest task end seen, for the execution span. */
-    @Volatile var firstTaskStartMs: Long = Long.MAX_VALUE
-        private set
-    @Volatile var lastTaskEndMs: Long = Long.MIN_VALUE
-        private set
+    /**
+     * Instantiated once per build, when the first build event is delivered.
+     * On a configuration-cache hit this is the earliest moment observable —
+     * see the note on `measured_from` below.
+     */
+    private val serviceStartMs: Long = System.currentTimeMillis()
 
-    private val totalCount = AtomicInteger()
-    private val executedCount = AtomicInteger()
-    private val fromCacheCount = AtomicInteger()
-    private val upToDateCount = AtomicInteger()
+    private val total = AtomicInteger()
+    private val executed = AtomicInteger()
+    private val fromCache = AtomicInteger()
+    private val upToDate = AtomicInteger()
+    private val anyTaskFailed = AtomicBoolean(false)
+    private val written = AtomicBoolean(false)
 
-    val total: Int get() = totalCount.get()
-    val executed: Int get() = executedCount.get()
-    val fromCache: Int get() = fromCacheCount.get()
-    val upToDate: Int get() = upToDateCount.get()
+    @Volatile private var firstTaskStartMs: Long = Long.MAX_VALUE
+    @Volatile private var lastTaskEndMs: Long = Long.MIN_VALUE
 
     override fun onFinish(event: FinishEvent) {
         if (event !is TaskFinishEvent) return
         try {
-            totalCount.incrementAndGet()
+            total.incrementAndGet()
             synchronized(this) {
                 if (event.result.startTime < firstTaskStartMs) firstTaskStartMs = event.result.startTime
                 if (event.result.endTime > lastTaskEndMs) lastTaskEndMs = event.result.endTime
             }
             when (val result = event.result) {
                 is TaskSuccessResult -> when {
-                    result.isFromCache -> fromCacheCount.incrementAndGet()
-                    result.isUpToDate -> upToDateCount.incrementAndGet()
-                    else -> executedCount.incrementAndGet()
+                    result.isFromCache -> fromCache.incrementAndGet()
+                    result.isUpToDate -> upToDate.incrementAndGet()
+                    else -> executed.incrementAndGet()
                 }
                 is TaskSkippedResult -> Unit
-                else -> executedCount.incrementAndGet() // failed tasks did run
+                is TaskFailureResult -> {
+                    anyTaskFailed.set(true)
+                    executed.incrementAndGet() // a failed task did run
+                }
+                else -> executed.incrementAndGet()
             }
         } catch (ignored: Throwable) {
             // Never let accounting break a build.
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Build-completion writer
-// ---------------------------------------------------------------------------
-
-abstract class BuildLoopRecordAction : FlowAction<BuildLoopRecordAction.Params> {
-
-    interface Params : FlowParameters {
-        @get:Input val projectName: Property<String>
-        @get:Input val tasks: ListProperty<String>
-        @get:Input val configId: Property<String>
-        @get:Input val buildStartMs: Property<Long>
-        @get:Input val configCacheMode: Property<String>
-        @get:Input val gradleVersion: Property<String>
-        @get:Input val homeDir: Property<String>
-        @get:Input val failed: Property<Boolean>
-
-        @get:ServiceReference("buildloopTaskStats")
-        val stats: Property<BuildLoopTaskStats>
-    }
-
-    override fun execute(parameters: Params) {
+    /** Gradle closes build services at the end of the build. This is the hook. */
+    override fun close() {
+        if (!written.compareAndSet(false, true)) return
         try {
-            write(parameters)
+            writeRow()
         } catch (ignored: Throwable) {
             // A metrics tool that breaks the build has negative value.
         }
     }
 
-    private fun write(p: Params) {
+    private fun writeRow() {
         val now = System.currentTimeMillis()
-        val home = File(p.homeDir.get())
-        val stats = p.stats.orNull
+        val home = File(parameters.homeDir.get())
+        val configCache = detectConfigCache(home, parameters.configId.get(), parameters.configCacheMode.get())
+        val taskCount = total.get()
 
-        val configCache = detectConfigCache(home, p.configId.get(), p.configCacheMode.get())
+        // Task-execution span. Unlike duration_ms this means the same thing on
+        // every build, so it is the metric to reach for when comparing across
+        // configuration-cache states.
+        val execSpanMs: Long? =
+            if (taskCount > 0 && lastTaskEndMs >= firstTaskStartMs) lastTaskEndMs - firstTaskStartMs else null
 
         // What we can honestly measure depends on whether configuration ran.
         //
@@ -145,57 +151,46 @@ abstract class BuildLoopRecordAction : FlowAction<BuildLoopRecordAction.Params> 
         // settings evaluation, configuration and execution.
         //
         // On a HIT, none of that ran: `buildStartMs` is a stale value restored
-        // from the cache, and the earliest moment buildloop can observe is the
-        // first task event. Configuration-cache *load* time (a few hundred ms
-        // on a large build) precedes that and is not exposed by any public
-        // Gradle API — `BuildEventsListenerRegistry` offers only
-        // `onTaskCompletion`. So a hit build's duration is execution-only, and
+        // from the cache, and the earliest moment buildloop can observe is this
+        // service's own construction. Configuration-cache *load* time (a few
+        // hundred ms on a large build) precedes it and is not exposed by any
+        // public Gradle API. So a hit build's duration is execution-only, and
         // says so via `measured_from` rather than quietly under-reporting into
         // the same series as a full build.
-        val execSpanMs: Long? = stats
-            ?.takeIf { it.total > 0 && it.lastTaskEndMs >= it.firstTaskStartMs }
-            ?.let { it.lastTaskEndMs - it.firstTaskStartMs }
-
         val fullMeasurement = configCache != BuildLoopConfig.HIT
-        val durationMs: Long? = when {
-            fullMeasurement -> now - p.buildStartMs.get()
-            stats == null -> null
-            else -> now - minOf(stats.serviceStartMs, stats.firstTaskStartMs)
-        }
-        val measuredFrom = when {
-            durationMs == null -> null
-            fullMeasurement -> BuildLoopConfig.FROM_BUILD_START
-            else -> BuildLoopConfig.FROM_EXECUTION
-        }
+        val durationMs: Long =
+            if (fullMeasurement) now - parameters.buildStartMs.get()
+            else now - minOf(serviceStartMs, firstTaskStartMs)
+        val measuredFrom =
+            if (fullMeasurement) BuildLoopConfig.FROM_BUILD_START else BuildLoopConfig.FROM_EXECUTION
 
         val uptimeMs = runCatching { ManagementFactory.getRuntimeMXBean().uptime }.getOrNull()
         val daemonReused: Boolean? =
-            if (uptimeMs == null || durationMs == null) null
-            else uptimeMs > durationMs + BuildLoopConfig.DAEMON_FRESH_SLACK_MS
+            if (uptimeMs == null) null else uptimeMs > durationMs + BuildLoopConfig.DAEMON_FRESH_SLACK_MS
 
         val json = buildString {
             append('{')
             appendField("ts", Instant.now().truncatedTo(ChronoUnit.SECONDS).toString())
             append(',')
-            appendField("project", p.projectName.get())
+            appendField("project", parameters.projectName.get())
             append(",\"tasks\":[")
-            p.tasks.get().forEachIndexed { i, t ->
+            parameters.tasks.get().forEachIndexed { i, t ->
                 if (i > 0) append(',')
                 append('"').append(escape(t)).append('"')
             }
             append(']')
-            append(",\"duration_ms\":").append(durationMs ?: "null")
-            append(",\"measured_from\":").append(if (measuredFrom == null) "null" else "\"$measuredFrom\"")
+            append(",\"duration_ms\":").append(durationMs)
+            append(",\"measured_from\":\"").append(measuredFrom).append('"')
             append(",\"exec_ms\":").append(execSpanMs ?: "null")
             append(',')
-            appendField("outcome", if (p.failed.get()) "failed" else "success")
-            append(",\"task_count\":").append(stats?.total ?: "null")
-            append(",\"executed\":").append(stats?.executed ?: "null")
-            append(",\"from_cache\":").append(stats?.fromCache ?: "null")
-            append(",\"up_to_date\":").append(stats?.upToDate ?: "null")
+            appendField("outcome", if (anyTaskFailed.get()) "failed" else "success")
+            append(",\"task_count\":").append(taskCount)
+            append(",\"executed\":").append(executed.get())
+            append(",\"from_cache\":").append(fromCache.get())
+            append(",\"up_to_date\":").append(upToDate.get())
             append(",\"config_cache\":").append(if (configCache == null) "null" else "\"$configCache\"")
             append(',')
-            appendField("gradle_version", p.gradleVersion.get())
+            appendField("gradle_version", parameters.gradleVersion.get())
             append(",\"daemon_reused\":").append(daemonReused?.toString() ?: "null")
             append('}')
             append('\n')
@@ -212,11 +207,12 @@ abstract class BuildLoopRecordAction : FlowAction<BuildLoopRecordAction.Params> 
      * Configuration-cache hit/miss, by heuristic.
      *
      * An init script's *configuration* phase only runs on a cache miss, while
-     * the registered FlowAction is restored and fires either way. So a config
-     * id we have never seen before was generated this build (configuration ran
-     * => miss); an id already on record was restored from a cache entry (hit).
+     * the registered build service is restored from the cache and instantiated
+     * either way. So a config id we have never seen before was generated this
+     * build (configuration ran => miss); an id already on record was restored
+     * from a cache entry (=> hit).
      *
-     * The seen-ids are kept as a SET rather than a single "last id", because a
+     * The seen ids are kept as a SET rather than a single "last id", because a
      * single slot is wrong the moment a project has more than one cache entry:
      * alternating `assembleDebug` and `test` builds would each see the other's
      * id and report a miss on every build.
@@ -265,8 +261,6 @@ abstract class BuildLoopRecordAction : FlowAction<BuildLoopRecordAction.Params> 
 // ---------------------------------------------------------------------------
 
 abstract class BuildLoopPlugin @Inject constructor(
-    private val flowScope: FlowScope,
-    private val flowProviders: FlowProviders,
     private val eventsRegistry: BuildEventsListenerRegistry,
 ) : Plugin<Settings> {
 
@@ -275,12 +269,6 @@ abstract class BuildLoopPlugin @Inject constructor(
         val home = BuildLoopConfig.home()
         val projectName = BuildLoopConfig.resolveProject(home, settings.rootProject.name) ?: return
 
-        val statsService = gradle.sharedServices.registerIfAbsent(
-            BuildLoopConfig.SERVICE_NAME, BuildLoopTaskStats::class.java
-        ) {}
-        eventsRegistry.onTaskCompletion(statsService)
-
-        val configId = UUID.randomUUID().toString()
         // Set by the init script's top-level code, which runs before the
         // settings script — the earliest point buildloop can observe. Falls
         // back to now if absent, which only under-reports.
@@ -289,23 +277,23 @@ abstract class BuildLoopPlugin @Inject constructor(
             ?.get(BuildLoopConfig.START_MS_KEY) as? Long) ?: System.currentTimeMillis()
         val startParameter = gradle.startParameter
 
-        flowScope.always(BuildLoopRecordAction::class.java) {
+        val collector = gradle.sharedServices.registerIfAbsent(
+            BuildLoopConfig.SERVICE_NAME, BuildLoopCollector::class.java
+        ) {
             parameters.projectName.set(projectName)
             parameters.tasks.set(startParameter.taskNames)
-            parameters.configId.set(configId)
+            parameters.configId.set(UUID.randomUUID().toString())
             parameters.buildStartMs.set(buildStartMs)
             parameters.configCacheMode.set(BuildLoopConfig.configCacheMode(startParameter))
             parameters.gradleVersion.set(gradle.gradleVersion)
             parameters.homeDir.set(home.absolutePath)
-            parameters.failed.set(
-                flowProviders.buildWorkResult.map { it.failure.isPresent }
-            )
         }
+        eventsRegistry.onTaskCompletion(collector)
     }
 }
 
 object BuildLoopConfig {
-    const val SERVICE_NAME = "buildloopTaskStats"
+    const val SERVICE_NAME = "buildloopCollector"
     const val HIT = "hit"
     const val MISS = "miss"
     const val MAX_TRACKED_CONFIG_IDS = 200
@@ -317,6 +305,9 @@ object BuildLoopConfig {
     const val CC_ENABLED = "enabled"
     const val CC_DISABLED = "disabled"
     const val CC_UNKNOWN = "unknown"
+
+    /** A fresh daemon's first build has uptime ~= startup + build; a reused one has far more. */
+    const val DAEMON_FRESH_SLACK_MS = 15_000L
 
     /**
      * Is the configuration cache on for this build?
@@ -349,9 +340,6 @@ object BuildLoopConfig {
         }
         return CC_UNKNOWN
     }
-
-    /** A fresh daemon's first build has uptime ~= startup + build; a reused one has far more. */
-    const val DAEMON_FRESH_SLACK_MS = 15_000L
 
     /**
      * Match `rootProject.name` against the tracked-project list.
