@@ -16,7 +16,8 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from . import __version__, ci_collector, config as config_mod, dashboard, db, gh, gradle_ingest
+from . import (__version__, ci_collector, config as config_mod, dashboard, db, gh,
+               gradle_ingest, insights)
 
 INIT_SCRIPT_NAME = "buildloop.init.gradle.kts"
 
@@ -55,8 +56,16 @@ def cmd_refresh(args) -> int:
             else:
                 print("  ci: not configured (no github_repo)")
 
+            # --no-analysis suppresses the *call*, not the panel: an analysis
+            # written on a previous run is still the best thing we know.
+            analysis = (
+                insights.load_cached(conn, project.name)
+                if args.no_analysis
+                else insights.generate(conn, project.name, force=args.reanalyse, log=print)
+            )
+
             out = cfg.home / f"dashboard-{project.name}.html"
-            out.write_text(dashboard.render(conn, project.name), encoding="utf-8")
+            out.write_text(dashboard.render(conn, project.name, analysis), encoding="utf-8")
             outputs.append(out)
             print(f"  dashboard: {out}")
 
@@ -163,6 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     refresh = sub.add_parser("refresh", help="collect data and regenerate dashboards")
     refresh.add_argument("projects", nargs="*", help="project names; default is all configured")
     refresh.add_argument("--open", action="store_true", help="open the first dashboard when done")
+    refresh.add_argument("--no-analysis", action="store_true",
+                         help="do not call claude; keep any commentary already written")
+    refresh.add_argument("--reanalyse", "--reanalyze", action="store_true", dest="reanalyse",
+                         help="rewrite the commentary even if the numbers are unchanged")
     refresh.set_defaults(func=cmd_refresh)
 
     status = sub.add_parser("status", help="show what is stored (no network)")

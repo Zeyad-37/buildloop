@@ -1,9 +1,15 @@
-"""Hand-rolled inline SVG charts.
+"""Hand-rolled inline SVG charts with hover tooltips.
 
 No CDN, no chart library, no external requests — the generated dashboard works
 offline and will still open in five years (RFC T-055 §4.5). Colours come from
 CSS custom properties so the page follows the reader's light/dark preference
 without duplicating a palette here.
+
+Each chart returns its markup plus a small metadata record. The page collects
+those into one JSON blob that a ~60-line script turns into tooltips, so the
+values behind every mark are readable without exporting the data. Values are
+formatted server-side: the Python formatters are the single source of truth,
+and the browser only positions strings.
 """
 
 from __future__ import annotations
@@ -21,6 +27,14 @@ SERIES_COLORS = 6  # matches --s0..--s5 in the stylesheet
 class Series:
     label: str
     points: list[tuple[str, float | None]] = field(default_factory=list)
+
+
+@dataclass
+class Chart:
+    """Rendered markup plus the data its tooltip needs."""
+
+    html: str
+    meta: dict | None = None
 
 
 def esc(text) -> str:
@@ -77,34 +91,47 @@ def _legend(labels: list[str]) -> str:
     return f'<div class="legend">{items}</div>'
 
 
-def _frame(title: str, subtitle: str, body: str, legend: str = "") -> str:
+def _frame(cid, title, subtitle, body, legend="", height=H) -> str:
     return (
-        f'<figure class="chart">'
+        f'<figure class="chart" id="{esc(cid)}">'
         f"<figcaption><h3>{esc(title)}</h3><p>{esc(subtitle)}</p></figcaption>"
         f"{legend}"
-        f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{esc(title)}">{body}</svg>'
+        f'<svg viewBox="0 0 {W} {height}" role="img" aria-label="{esc(title)}">{body}</svg>'
         f"</figure>"
     )
 
 
-def empty(title: str, subtitle: str, reason: str) -> str:
-    return _frame(title, subtitle, f'<text class="empty" x="{W // 2}" y="{H // 2}" text-anchor="middle">{esc(reason)}</text>')
+def empty(cid, title, subtitle, reason) -> Chart:
+    body = f'<text class="empty" x="{W // 2}" y="{H // 2}" text-anchor="middle">{esc(reason)}</text>'
+    return Chart(_frame(cid, title, subtitle, body))
 
 
-def line_chart(title, subtitle, categories, series: list[Series], y_fmt=str) -> str:
+def _fmt_or_none(value, fmt):
+    return None if value is None else fmt(value)
+
+
+def line_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str) -> Chart:
     """Multi-series line chart over evenly spaced categories (weeks)."""
     values = [v for s in series for _, v in s.points if v is not None]
     if not values:
-        return empty(title, subtitle, "no data yet")
+        return empty(cid, title, subtitle, "no data yet")
     y_max = _nice_max(max(values))
     plot_w, plot_h = W - PAD_L - PAD_R, H - PAD_T - PAD_B
     index = {c: i for i, c in enumerate(categories)}
     n = max(len(categories) - 1, 1)
 
+    def x_at(i: int) -> float:
+        return PAD_L + plot_w * i / n
+
     parts = _axes(categories, y_max, y_fmt, x_slot_center=False)
+    parts.append(f'<line class="cursor" y1="{PAD_T}" y2="{PAD_T + plot_h}" x1="0" x2="0"/>')
+
+    lookup: list[list[str | None]] = []
     for si, s in enumerate(series):
+        by_cat = {c: v for c, v in s.points}
+        lookup.append([_fmt_or_none(by_cat.get(c), y_fmt) for c in categories])
         pts = [
-            (PAD_L + plot_w * index[c] / n, PAD_T + plot_h * (1 - v / y_max))
+            (x_at(index[c]), PAD_T + plot_h * (1 - v / y_max))
             for c, v in s.points
             if v is not None and c in index
         ]
@@ -113,27 +140,44 @@ def line_chart(title, subtitle, categories, series: list[Series], y_fmt=str) -> 
         color = f"var(--s{si % SERIES_COLORS})"
         path = " ".join(f"{'M' if i == 0 else 'L'}{x:.1f},{y:.1f}" for i, (x, y) in enumerate(pts))
         parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
-        if len(pts) == 1:
-            x, y = pts[0]
-            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}"/>')
-    return _frame(title, subtitle, "".join(parts), _legend([s.label for s in series]))
+        for c, v in s.points:
+            if v is None or c not in index:
+                continue
+            cx, cy = x_at(index[c]), PAD_T + plot_h * (1 - v / y_max)
+            parts.append(
+                f'<circle class="dot" data-s="{si}" data-i="{index[c]}" '
+                f'cx="{cx:.1f}" cy="{cy:.1f}" r="3.5" fill="{color}"/>'
+            )
+
+    # Invisible hover bands, one per category, so the whole column is a target
+    # rather than requiring the reader to hit a 3px dot.
+    slot = plot_w / max(len(categories), 1)
+    for i in range(len(categories)):
+        parts.append(
+            f'<rect class="hit" data-i="{i}" x="{max(x_at(i) - slot / 2, 0):.1f}" y="{PAD_T}" '
+            f'width="{slot:.1f}" height="{plot_h}"/>'
+        )
+
+    meta = {
+        "type": "line",
+        "categories": categories,
+        "series": [{"label": s.label, "values": lookup[i]} for i, s in enumerate(series)],
+    }
+    return Chart(_frame(cid, title, subtitle, "".join(parts), _legend([s.label for s in series])), meta)
 
 
-def stacked_bar_chart(title, subtitle, categories, series: list[Series], y_fmt=str) -> str:
+def stacked_bar_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str) -> Chart:
     """Stacked bars — for compositions that must be read as a whole."""
-    totals = [
-        sum(v or 0 for s in series for c, v in s.points if c == cat)
-        for cat in categories
-    ]
+    lookup = [{c: v for c, v in s.points} for s in series]
+    totals = [sum(t.get(cat) or 0 for t in lookup) for cat in categories]
     if not any(totals):
-        return empty(title, subtitle, "no data yet")
+        return empty(cid, title, subtitle, "no data yet")
     y_max = _nice_max(max(totals))
     plot_w, plot_h = W - PAD_L - PAD_R, H - PAD_T - PAD_B
     slot = plot_w / max(len(categories), 1)
     bar_w = max(slot * 0.7, 1.0)
 
     parts = _axes(categories, y_max, y_fmt, x_slot_center=True)
-    lookup = [{c: v for c, v in s.points} for s in series]
     for ci, cat in enumerate(categories):
         base = 0.0
         x = PAD_L + slot * ci + (slot - bar_w) / 2
@@ -149,13 +193,28 @@ def stacked_bar_chart(title, subtitle, categories, series: list[Series], y_fmt=s
                 f'{esc(series[si].label)}: {esc(y_fmt(value))}</title></rect>'
             )
             base += value
-    return _frame(title, subtitle, "".join(parts), _legend([s.label for s in series]))
+        parts.append(
+            f'<rect class="hit" data-i="{ci}" x="{PAD_L + slot * ci:.1f}" y="{PAD_T}" '
+            f'width="{slot:.1f}" height="{plot_h}"/>'
+        )
+
+    meta = {
+        "type": "stack",
+        "categories": categories,
+        "series": [
+            {"label": s.label, "values": [_fmt_or_none(lookup[i].get(c), y_fmt) for c in categories]}
+            for i, s in enumerate(series)
+        ],
+        "totals": [y_fmt(t) for t in totals],
+    }
+    return Chart(_frame(cid, title, subtitle, "".join(parts), _legend([s.label for s in series])), meta)
 
 
-def hbar_chart(title, subtitle, rows: list[tuple[str, float]], value_fmt=str) -> str:
+def hbar_chart(cid, title, subtitle, rows: list[tuple[str, float]], value_fmt=str,
+               note: str | None = None) -> Chart:
     """Horizontal bars — for ranking a handful of named things."""
     if not rows:
-        return empty(title, subtitle, "no data yet")
+        return empty(cid, title, subtitle, "no data yet")
     height = PAD_T + PAD_B + 26 * len(rows)
     label_w = 300
     bar_max = W - label_w - 90
@@ -166,8 +225,7 @@ def hbar_chart(title, subtitle, rows: list[tuple[str, float]], value_fmt=str) ->
         w = bar_max * value / top
         shown = label if len(label) <= 44 else label[:41] + "…"
         parts.append(
-            f'<text class="rowlabel" x="{label_w - 10}" y="{y + 14}" text-anchor="end">{esc(shown)}'
-            f"<title>{esc(label)}</title></text>"
+            f'<text class="rowlabel" x="{label_w - 10}" y="{y + 14}" text-anchor="end">{esc(shown)}</text>'
         )
         parts.append(
             f'<rect x="{label_w}" y="{y + 3}" width="{max(w, 1):.1f}" height="15" rx="2" fill="var(--s0)"/>'
@@ -175,8 +233,11 @@ def hbar_chart(title, subtitle, rows: list[tuple[str, float]], value_fmt=str) ->
         parts.append(
             f'<text class="tick" x="{label_w + max(w, 1) + 8:.1f}" y="{y + 15}">{esc(value_fmt(value))}</text>'
         )
-    body = "".join(parts)
-    return (
-        f'<figure class="chart"><figcaption><h3>{esc(title)}</h3><p>{esc(subtitle)}</p></figcaption>'
-        f'<svg viewBox="0 0 {W} {height}" role="img" aria-label="{esc(title)}">{body}</svg></figure>'
-    )
+        parts.append(f'<rect class="hit" data-i="{i}" x="0" y="{y}" width="{W}" height="21"/>')
+
+    meta = {
+        "type": "hbar",
+        "rows": [{"label": l, "value": value_fmt(v)} for l, v in rows],
+        "note": note,
+    }
+    return Chart(_frame(cid, title, subtitle, "".join(parts), height=height), meta)

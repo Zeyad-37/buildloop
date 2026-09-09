@@ -115,6 +115,32 @@ that looks meaningful and is not.
 The local charts start empty — there is no way to recover builds that already
 happened, so give it a couple of weeks before the local half is interesting.
 
+Every mark on every chart is hoverable: a tooltip gives the week, each series'
+value, and the stack total where there is one. Values are formatted in Python
+and shipped as strings, so the page's own script only has to position them.
+
+### The analysis panel
+
+Above the charts, buildloop writes a few paragraphs on what the numbers appear
+to mean — which workflow got flakier, whether a slowdown is queueing or work,
+which of the slow steps have enough samples to plan against.
+
+This shells out to the [`claude`](https://claude.com/claude-code) CLI, the same
+way the collector shells out to `gh`: no API key is handled, and nothing is
+added to the Python side. If `claude` is not installed the page renders exactly
+as before.
+
+Two things keep it cheap and honest. The model never sees raw rows — only a
+summary whose every number was computed in SQL and Python first, so the prose
+is commentary on arithmetic that already happened. And the summary is hashed,
+so the model is only called when the numbers actually changed; a refresh on a
+quiet afternoon costs nothing.
+
+```bash
+buildloop refresh --no-analysis   # don't call claude; keep what's already written
+buildloop refresh --reanalyse     # rewrite it even if nothing changed
+```
+
 ## How it works
 
 ```
@@ -181,12 +207,17 @@ comparison UI, a settings UI, any multi-user concept.
 python3 -m unittest discover -s tests
 ```
 
-Tests concentrate on the two parsing boundaries where a bug would silently
-corrupt history and be hard to notice: GitHub response mapping (duration
-arithmetic, re-run handling, pagination boundaries, upsert idempotency) and
-JSONL ingest (truncated lines, watermark correctness, re-ingest safety). The
-HTML generator is deliberately untested — a visual defect is immediately
-obvious, and snapshot-testing hand-rolled SVG costs more than it protects.
+Tests concentrate on the boundaries where a bug would silently corrupt history
+and be hard to notice: GitHub response mapping (duration arithmetic, re-run
+handling, pagination boundaries, upsert idempotency), JSONL ingest (truncated
+lines, watermark correctness, re-ingest safety), the analysis summary (window
+splitting, human units, keeping the two duration populations apart), and the
+tooltip metadata (gaps stay null rather than becoming zero).
+
+Chart *rendering* is deliberately untested — a visual defect is immediately
+obvious, and snapshot-testing hand-rolled SVG costs more than it protects. The
+data behind the marks is tested, because a wrong tooltip is not obvious at
+all.
 
 The Gradle init script is the exception and gets a manual verification matrix,
 because it runs on every local build: see `docs/verification.md`.
