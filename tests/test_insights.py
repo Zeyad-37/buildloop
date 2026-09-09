@@ -107,6 +107,17 @@ class TestFingerprint(unittest.TestCase):
         self.assertNotEqual(insights.fingerprint({"x": 1}), insights.fingerprint({"x": 2}))
 
 
+class TestWindowBoundary(unittest.TestCase):
+    def test_boundary_is_floored_to_midnight(self):
+        # A boundary that moves every second reshuffles runs between buckets on
+        # every refresh, so the fingerprint never repeats and the cache never
+        # hits — a model call on every run instead of only when data changes.
+        self.assertTrue(insights._iso_days_ago(28).endswith("T00:00:00Z"))
+
+    def test_boundary_is_stable_across_calls(self):
+        self.assertEqual(insights._iso_days_ago(28), insights._iso_days_ago(28))
+
+
 class TestPrompt(unittest.TestCase):
     def test_prompt_forbids_comparing_the_two_duration_populations(self):
         prompt = insights.build_prompt({"project": "p"})

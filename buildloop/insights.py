@@ -46,7 +46,16 @@ class InsightUnavailable(Exception):
 # --- summary ----------------------------------------------------------------
 
 def _iso_days_ago(days: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Window boundary, floored to midnight UTC.
+
+    Deliberately not `now - days`. A boundary that moves every second shuffles
+    runs between the recent and previous buckets on every refresh, so the
+    summary fingerprint never repeats and the cache never hits — turning a
+    free re-render into a model call every time. Day granularity is ample for
+    a 28-day window.
+    """
+    midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (midnight - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _median(values):
