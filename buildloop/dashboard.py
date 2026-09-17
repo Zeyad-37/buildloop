@@ -303,6 +303,49 @@ def _analysis(record: dict | None) -> str:
     return f'<section class="analysis"><h2>What the numbers say</h2>{body}{by}</section>'
 
 
+_SUGGESTIONS = (
+    "Which CI job fails most often, and is it getting worse?",
+    "Is CI slower this month than last month?",
+    "Summarise my local builds this week.",
+)
+
+
+def _ask_panel(ask: dict | None) -> str:
+    """The question box.
+
+    Always rendered, so the feature is discoverable from the static file too —
+    but only a page served by `buildloop serve` carries the token that makes
+    it work. Everything Claude writes is inserted with `textContent`, never as
+    markup.
+    """
+    live = bool(ask and ask.get("available"))
+    if live:
+        hint = "Answers come from the numbers behind these charts. Follow-up questions keep context."
+    elif ask:
+        hint = "The <code>claude</code> CLI isn't on PATH, so questions are unavailable."
+    else:
+        hint = ("Questions need the local server — run <code>buildloop serve</code> "
+                "and open the page it prints.")
+    disabled = "" if live else " disabled"
+    chips = "".join(
+        f'<button type="button" data-q="{charts.esc(q)}"{disabled}>{charts.esc(q)}</button>'
+        for q in _SUGGESTIONS
+    )
+    return (
+        '<section class="ask" id="ask" aria-labelledby="ask-h">'
+        '<h2 id="ask-h">Ask Claude about this data</h2>'
+        f'<p class="hint">{hint}</p>'
+        '<div class="log" id="ask-log" aria-live="polite"></div>'
+        '<form id="ask-form">'
+        f'<input id="ask-q" name="q" maxlength="500" autocomplete="off" aria-label="Question" '
+        f'placeholder="e.g. Why did Verify PRs get flakier?"{disabled}>'
+        f'<button type="submit"{disabled}>Ask</button>'
+        '</form>'
+        f'<div class="chips">{chips}</div>'
+        '</section>'
+    )
+
+
 def _stat(label: str, value: str, note: str = "") -> str:
     note_html = f"<small>{charts.esc(note)}</small>" if note else ""
     return f'<div class="stat"><dt>{charts.esc(label)}</dt><dd>{charts.esc(value)}{note_html}</dd></div>'
@@ -380,6 +423,27 @@ svg{display:block;width:100%;height:auto;margin-top:10px;min-width:640px}
 .analysis p{margin:0 0 10px;max-width:74ch}
 .analysis p:last-of-type{margin-bottom:0}
 .analysis .by{margin-top:10px;font-size:11px;color:var(--muted)}
+.ask{margin:14px 0 6px;padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:8px}
+.ask h2{margin:0 0 4px;padding:0;border:0;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.ask .hint{margin:0 0 10px;font-size:13px;color:var(--muted)}
+.ask code{font-size:12px;padding:1px 5px;border-radius:4px;background:var(--line)}
+.ask form{display:flex;gap:8px}
+.ask input{flex:1;min-width:0;font:inherit;padding:8px 10px;border-radius:6px;
+  border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.ask input:focus{outline:2px solid var(--s0);outline-offset:1px}
+.ask button{font:inherit;padding:8px 14px;border-radius:6px;border:1px solid var(--s0);
+  background:var(--s0);color:#fff;cursor:pointer}
+.ask button:disabled,.ask input:disabled{opacity:.5;cursor:not-allowed}
+.ask .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.ask .chips button{font-size:12px;padding:4px 10px;background:transparent;color:var(--fg);border-color:var(--line)}
+.ask .log{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+.ask .log:empty{display:none}
+.ask .q{align-self:flex-end;max-width:85%;padding:7px 11px;border-radius:10px 10px 2px 10px;
+  background:var(--s0);color:#fff;white-space:pre-wrap}
+.ask .a{max-width:95%;padding:9px 12px;border-radius:10px 10px 10px 2px;border:1px solid var(--line);
+  white-space:pre-wrap;line-height:1.5}
+.ask .a.wait{color:var(--muted);font-style:italic}
+.ask .a.err{border-color:var(--s5);color:var(--s5)}
 .key{display:inline-flex;align-items:center;gap:6px}
 .key i{width:11px;height:11px;border-radius:2px;display:inline-block}
 footer{margin-top:44px;color:var(--muted);font-size:12px}
@@ -482,7 +546,80 @@ _TOOLTIP_JS = """
 """
 
 
-def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None) -> str:
+_ASK_JS = """
+(function () {
+  var cfg = window.BUILDLOOP_ASK;
+  var form = document.getElementById('ask-form');
+  if (!cfg || !form) return;
+  var input = document.getElementById('ask-q');
+  var log = document.getElementById('ask-log');
+  var buttons = document.querySelectorAll('#ask button');
+  var history = [];
+  var busy = false;
+
+  function bubble(cls, text) {
+    var el = document.createElement('div');
+    el.className = cls;
+    el.textContent = text;          // never innerHTML: this text came from a model
+    log.appendChild(el);
+    return el;
+  }
+
+  function setBusy(on) {
+    busy = on;
+    input.disabled = on;
+    buttons.forEach(function (b) { b.disabled = on; });
+  }
+
+  function ask(question) {
+    question = question.trim();
+    if (!question || busy) return;
+    bubble('q', question);
+    var pending = bubble('a wait', 'Thinking…');
+    setBusy(true);
+    input.value = '';
+
+    fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Buildloop-Token': cfg.token },
+      body: JSON.stringify({ project: cfg.project, question: question, history: history.slice(-6) })
+    })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          return { ok: res.ok, body: body };
+        });
+      })
+      .then(function (r) {
+        pending.classList.remove('wait');
+        if (r.ok && r.body.answer) {
+          pending.textContent = r.body.answer;
+          history.push({ question: question, answer: r.body.answer });
+        } else {
+          pending.classList.add('err');
+          pending.textContent = r.body.error || 'Something went wrong.';
+        }
+      })
+      .catch(function () {
+        pending.classList.remove('wait');
+        pending.classList.add('err');
+        pending.textContent = "Couldn't reach buildloop serve — is it still running?";
+      })
+      .then(function () {
+        setBusy(false);
+        input.focus();
+      });
+  }
+
+  form.addEventListener('submit', function (e) { e.preventDefault(); ask(input.value); });
+  document.querySelectorAll('#ask .chips button').forEach(function (b) {
+    b.addEventListener('click', function () { ask(b.getAttribute('data-q')); });
+  });
+})();
+"""
+
+
+def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
+           ask: dict | None = None) -> str:
     runs = conn.execute(
         "SELECT * FROM ci_run WHERE project = ? ORDER BY created_at", (project,)
     ).fetchall()
@@ -520,6 +657,10 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None)
     # </ ends a script element wherever it appears inside one, including inside
     # a string literal, so it has to be broken up.
     blob = json.dumps(registry, separators=(",", ":")).replace("</", "<\\/")
+    ask_cfg = (
+        json.dumps({"project": ask["project"], "token": ask["token"]}).replace("</", "<\\/")
+        if ask and ask.get("available") else "null"
+    )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     return f"""<!doctype html>
@@ -532,6 +673,7 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None)
 <p class="sub">Is the development loop getting faster or slower, and is CI getting flakier?</p>
 {_summary(runs, builds)}
 {_analysis(analysis)}
+{_ask_panel(ask)}
 
 <h2>GitHub Actions</h2>
 <p class="section-note">Cold, clean-checkout hosted runners.</p>
@@ -548,5 +690,7 @@ produces a comparison that looks meaningful and is not.</p>
 <div id="tip" role="tooltip"></div>
 <script>window.BUILDLOOP={blob};</script>
 <script>{_TOOLTIP_JS}</script>
+<script>window.BUILDLOOP_ASK={ask_cfg};</script>
+<script>{_ASK_JS}</script>
 </body></html>
 """

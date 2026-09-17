@@ -9,11 +9,14 @@ command.
 ```bash
 buildloop refresh          # all configured projects
 buildloop refresh steady   # just one
+buildloop serve --open     # the same dashboards, plus a box to ask Claude about them
 ```
 
-No server, no daemon, no hosting. No web framework, no build step, no package
-manager. The dashboard is a file you open with `file://`, it makes no network
-requests, and it works offline.
+No daemon, no hosting. No web framework, no build step, no package manager. The
+dashboard is a file you open with `file://`, it makes no network requests, and
+it works offline. The one exception is `serve`, which exists only because a
+static page can't run the `claude` CLI — it's opt-in, bound to 127.0.0.1, and
+stops when you press Ctrl-C.
 
 ## Why
 
@@ -141,6 +144,36 @@ buildloop refresh --no-analysis   # don't call claude; keep what's already writt
 buildloop refresh --reanalyse     # rewrite it even if nothing changed
 ```
 
+### Asking questions
+
+```bash
+buildloop serve --open            # http://127.0.0.1:8765
+```
+
+Serves the dashboards with a live question box under the analysis panel: "which
+job fails most, and is it getting worse?", "was CI slower this month?".
+Follow-ups keep the conversation, and a typical answer takes about ten seconds.
+
+Claude gets the same kind of input as the analysis panel — numbers computed
+here, never the database — widened to what specific questions need: weekly
+per-workflow series for the last 26 weeks, per-job failure rates for this 28-day
+window against the last, and the 60 most recent local builds. When the data
+can't answer something, it says so rather than guessing.
+
+Opening a dashboard file directly shows the box disabled, with a pointer to
+`serve`.
+
+**Why it's locked down.** Every question is a model call, and a server on
+localhost is reachable from any web page open in your browser. So the question
+endpoint only accepts requests that carry a token embedded in pages the server
+itself rendered, sent as JSON (which a foreign page can't do without a CORS
+preflight this server never answers), with a `Host` header naming the server
+itself (defeating DNS rebinding). It sends no CORS headers, so nothing
+cross-origin can read a response. Claude also runs with **no tools and no MCP
+servers** — the context includes branch and job names that came from GitHub,
+and a model that can only write text can at worst be misled, not made to act.
+Answers are inserted into the page as text, never as HTML.
+
 ## How it works
 
 ```
@@ -193,7 +226,8 @@ prior behaviour on the next invocation.
 
 ## Non-goals
 
-No server. No auth. No real-time. No alerting — this is for looking at trends
+No always-on server (`serve` runs only while you're using it). No auth — it
+listens on 127.0.0.1 only. No real-time. No alerting — this is for looking at trends
 deliberately, not for being paged; threshold alerts belong in CI. No
 multi-machine aggregation: local build data is from one laptop, by design.
 

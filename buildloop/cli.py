@@ -6,6 +6,7 @@ One entry point, everything else runs when asked:
     buildloop refresh steady     # one project
     buildloop install            # write config skeleton + link the init script
     buildloop status             # what's stored, without touching the network
+    buildloop serve --open       # dashboards + ask Claude, on 127.0.0.1
 """
 
 from __future__ import annotations
@@ -71,6 +72,36 @@ def cmd_refresh(args) -> int:
 
     if args.open and outputs:
         webbrowser.open(outputs[0].as_uri())
+    return 0
+
+
+def cmd_serve(args) -> int:
+    from . import claude_cli
+    from .server import BuildLoopServer
+
+    cfg = config_mod.load()
+    if not cfg.db_path.exists():
+        print("nothing collected yet — run: buildloop refresh", file=sys.stderr)
+        return 1
+    try:
+        server = BuildLoopServer(cfg, args.port)
+    except OSError as exc:
+        print(f"can't listen on 127.0.0.1:{args.port} ({exc}) — try --port", file=sys.stderr)
+        return 1
+
+    url = server.url()
+    print(f"buildloop serving on {url}", flush=True)
+    if not claude_cli.available():
+        print("  note: 'claude' is not on PATH, so the question box will be disabled")
+    print("  Ctrl-C to stop\n", flush=True)
+    if args.open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        server.server_close()
     return 0
 
 
@@ -177,6 +208,11 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--reanalyse", "--reanalyze", action="store_true", dest="reanalyse",
                          help="rewrite the commentary even if the numbers are unchanged")
     refresh.set_defaults(func=cmd_refresh)
+
+    serve = sub.add_parser("serve", help="serve the dashboards locally, with a box to ask Claude")
+    serve.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")
+    serve.add_argument("--open", action="store_true", help="open the dashboard in the browser")
+    serve.set_defaults(func=cmd_serve)
 
     status = sub.add_parser("status", help="show what is stored (no network)")
     status.set_defaults(func=cmd_status)

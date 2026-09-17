@@ -22,25 +22,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sqlite3
-import subprocess
-import tempfile
 from datetime import datetime, timedelta, timezone
 
-from . import db
+from . import claude_cli, db
 from .humanize import ms
 
 STATE_PREFIX = "insight:"
-DEFAULT_TIMEOUT = 240
+DEFAULT_TIMEOUT = claude_cli.DEFAULT_TIMEOUT
 
 #: Comparison windows. Four weeks is long enough to survive a quiet week and
 #: short enough that "recent" still means recent.
 WINDOW_DAYS = 28
-
-
-class InsightUnavailable(Exception):
-    """The narrative could not be produced. Never fatal."""
 
 
 # --- summary ----------------------------------------------------------------
@@ -245,32 +238,6 @@ def fingerprint(summary: dict) -> str:
     return hashlib.sha256(json.dumps(summary, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def available() -> bool:
-    return shutil.which("claude") is not None
-
-
-def _invoke(prompt: str, timeout: int) -> str:
-    # Run from a scratch directory: `claude` picks up project settings from the
-    # working directory, and a consumer repo's config has nothing to do with
-    # summarising numbers (it also spews permission warnings onto stderr).
-    with tempfile.TemporaryDirectory() as cwd:
-        try:
-            proc = subprocess.run(
-                ["claude", "-p", prompt],
-                capture_output=True, text=True, timeout=timeout, cwd=cwd,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise InsightUnavailable(f"claude timed out after {timeout}s") from exc
-        except OSError as exc:
-            raise InsightUnavailable(str(exc)) from exc
-    if proc.returncode != 0:
-        raise InsightUnavailable((proc.stderr or "").strip()[:200] or f"claude exited {proc.returncode}")
-    text = (proc.stdout or "").strip()
-    if not text:
-        raise InsightUnavailable("claude returned nothing")
-    return text
-
-
 def load_cached(conn: sqlite3.Connection, project: str) -> dict | None:
     raw = db.get_state(conn, STATE_PREFIX + project)
     if not raw:
@@ -299,7 +266,7 @@ def generate(conn: sqlite3.Connection, project: str, *, force: bool = False,
         print_("  analysis: unchanged since last run (cached)")
         return cached
 
-    if not available():
+    if not claude_cli.available():
         if cached:
             print_("  analysis: 'claude' not on PATH — keeping the previous one")
             return cached
@@ -308,8 +275,8 @@ def generate(conn: sqlite3.Connection, project: str, *, force: bool = False,
 
     print_("  analysis: asking claude…")
     try:
-        text = _invoke(build_prompt(summary), timeout)
-    except InsightUnavailable as exc:
+        text = claude_cli.run(build_prompt(summary), timeout)
+    except claude_cli.ClaudeUnavailable as exc:
         print_(f"  analysis: skipped ({exc})")
         return cached
     record = {
