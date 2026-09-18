@@ -3,6 +3,19 @@
 import os
 import sys
 
+# Checked before importing anything of ours: buildloop needs tomllib (3.11+),
+# and macOS still ships 3.9, so the default python3 on a Mac is often too old.
+# Without this the first thing a new user sees is a ModuleNotFoundError from
+# a stdlib import, which reads like a broken install rather than a version.
+if sys.version_info < (3, 11):
+    have = ".".join(str(n) for n in sys.version_info[:3])
+    sys.exit(
+        f"buildloop needs Python 3.11 or newer; this is {have} ({sys.executable}).\n"
+        "  macOS ships 3.9. Install a newer one (brew install python) and re-run,\n"
+        "  or invoke it directly:  /opt/homebrew/bin/python3 "
+        f"{os.path.relpath(os.path.realpath(__file__))} --help"
+    )
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from buildloop.cli import main  # noqa: E402

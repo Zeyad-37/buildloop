@@ -30,9 +30,13 @@ of the day goes. Build scans give you one build at a time and no pull-back API.
 
 ## Install
 
-Requires Python 3.11+ (macOS ships it) and the [`gh`](https://cli.github.com)
-CLI, already authenticated. There is nothing to `pip install` — buildloop is
-stdlib-only, on purpose.
+Requires Python 3.11 or newer (for `tomllib`) and the
+[`gh`](https://cli.github.com) CLI, already authenticated. There is nothing to
+`pip install` — buildloop is stdlib-only, on purpose.
+
+macOS still ships Python 3.9, so `brew install python` first if `python3 -V`
+says anything older. buildloop checks the version at startup and says so rather
+than failing on a stdlib import.
 
 ```bash
 git clone https://github.com/Zeyad-37/buildloop.git
@@ -81,9 +85,9 @@ Two things it is built never to do:
 
 It is a single `BuildService` that listens for task-completion events and
 writes its row when Gradle closes it at the end of the build. The documented
-`FlowAction` hook looked like the right answer and silently double-counts every
-build from an init script — `docs/verification.md` has the details, because it
-is the kind of bug that produces no error at all.
+`FlowAction` hook looks like the right answer and silently double-counts every
+build when used from an init script; `docs/verification.md` has the details,
+because it is the kind of bug that produces no error at all.
 
 Opt out for one build with `BUILDLOOP_DISABLE=1 ./gradlew …`, or permanently
 with `buildloop uninstall`.
@@ -227,9 +231,9 @@ prior behaviour on the next invocation.
 ## Non-goals
 
 No always-on server (`serve` runs only while you're using it). No auth — it
-listens on 127.0.0.1 only. No real-time. No alerting — this is for looking at trends
-deliberately, not for being paged; threshold alerts belong in CI. No
-multi-machine aggregation: local build data is from one laptop, by design.
+listens on 127.0.0.1 only. No real-time. No alerting: this is for looking at
+trends deliberately, not for being paged, and threshold alerts belong in CI.
+No multi-machine aggregation — local build data is from one laptop, by design.
 
 Portable here means *configurable for your projects*, not *distributable as a
 product*. Not planned: Gradle Plugin Portal publishing, a cross-project
