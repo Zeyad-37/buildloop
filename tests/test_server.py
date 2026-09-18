@@ -1,5 +1,6 @@
 import http.client
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -8,7 +9,7 @@ from pathlib import Path
 import support  # noqa: F401
 
 from buildloop import ask, claude_cli, config, db
-from buildloop.server import BuildLoopServer
+from buildloop.server import BuildLoopServer, already_serving
 
 
 class ServerTestCase(unittest.TestCase):
@@ -132,6 +133,29 @@ class TestRequestTrust(ServerTestCase):
         res.read()
         conn.close()
         self.assertIsNone(res.getheader("Access-Control-Allow-Origin"))
+
+
+class TestAlreadyServing(ServerTestCase):
+    """"Address already in use" has two causes that want opposite responses."""
+
+    def test_detects_a_running_buildloop(self):
+        self.assertTrue(already_serving(self.server.port))
+
+    def test_a_closed_port_is_not_one(self):
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+        self.assertFalse(already_serving(port, timeout=0.5))
+
+    def test_some_other_listener_is_not_one(self):
+        other = socket.socket()
+        other.bind(("127.0.0.1", 0))
+        other.listen(1)
+        try:
+            self.assertFalse(already_serving(other.getsockname()[1], timeout=0.5))
+        finally:
+            other.close()
 
 
 class TestPages(ServerTestCase):

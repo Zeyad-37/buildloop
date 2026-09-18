@@ -37,6 +37,7 @@ from .charts import esc
 from .config import Config
 
 BIND = "127.0.0.1"
+SERVER_NAME = "buildloop"
 MAX_BODY_BYTES = 32_000
 
 Answerer = Callable[[sqlite3.Connection, str, object, object], str]
@@ -67,7 +68,7 @@ class BuildLoopServer(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server: BuildLoopServer
-    server_version = "buildloop"
+    server_version = SERVER_NAME
 
     # --- routing ------------------------------------------------------------
 
@@ -182,6 +183,25 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server.quiet:
             return
         print(f"  {self.command} {self.path.split('?', 1)[0]} -> {args[1] if len(args) > 1 else ''}", flush=True)
+
+
+def already_serving(port: int, timeout: float = 1.0) -> bool:
+    """Is a buildloop server already listening on this port?
+
+    "Address already in use" has two very different causes — your own server
+    from earlier, or something unrelated — and they want opposite responses.
+    Identified by the Server header, which only this server sends.
+    """
+    import http.client
+
+    conn = http.client.HTTPConnection(BIND, port, timeout=timeout)
+    try:
+        conn.request("HEAD", "/", headers={"Host": f"{BIND}:{port}"})
+        return (conn.getresponse().getheader("Server") or "").startswith(SERVER_NAME)
+    except OSError:
+        return False
+    finally:
+        conn.close()
 
 
 def _index(names: list[str]) -> str:

@@ -12,6 +12,7 @@ One entry point, everything else runs when asked:
 from __future__ import annotations
 
 import argparse
+import errno
 import shutil
 import sys
 import webbrowser
@@ -83,10 +84,27 @@ def cmd_serve(args) -> int:
     if not cfg.db_path.exists():
         print("nothing collected yet — run: buildloop refresh", file=sys.stderr)
         return 1
+    from .server import already_serving
+
     try:
         server = BuildLoopServer(cfg, args.port)
     except OSError as exc:
-        print(f"can't listen on 127.0.0.1:{args.port} ({exc}) — try --port", file=sys.stderr)
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        url = f"http://127.0.0.1:{args.port}/"
+        if already_serving(args.port):
+            print(f"buildloop is already serving on {url}")
+            if args.open:
+                webbrowser.open(url)
+            else:
+                print("  open that, or pass --port to start a second one")
+            return 0
+        print(
+            f"port {args.port} is taken by something else.\n"
+            f"  what has it:  lsof -nP -iTCP:{args.port} -sTCP:LISTEN\n"
+            f"  or pick another:  buildloop serve --port {args.port + 1}",
+            file=sys.stderr,
+        )
         return 1
 
     url = server.url()
