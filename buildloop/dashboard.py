@@ -16,7 +16,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
-from . import charts
+from . import charts, db
 from .charts import Chart, Series
 from .humanize import count, ms, pct
 
@@ -196,6 +196,62 @@ def ci_slow_steps_chart(cid, conn, project) -> Chart:
         f"Median duration, last {JOB_WINDOW_DAYS} days, steps seen at least 3 times. Where inside the job.",
         ranked, ms, note="median step duration",
     )
+
+
+FAILURE_GROUPS = 15
+
+
+def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None = None) -> str:
+    """The table that says what the failures in "Failures by job" actually were."""
+    since = (datetime.now(timezone.utc) - timedelta(days=JOB_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = db.failure_groups(conn, project, since)
+    head = (
+        '<section class="chart failures" id="failures"><figcaption>'
+        "<h3>Why CI fails</h3>"
+        f"<p>Failed jobs in the last {JOB_WINDOW_DAYS} days, grouped by the error in the failing "
+        "step's log. The same failure with different numbers counts once. Expand a row for the "
+        "latest occurrence.</p></figcaption>"
+    )
+    groups = data["groups"]
+    if not groups:
+        msg = ("No failed jobs in this window." if not data["total"]
+               else "Failures are recorded but none have been diagnosed yet — run "
+                    "<code>buildloop refresh</code>.")
+        return f'{head}<p class="empty-note">{msg}</p></section>'
+
+    items = []
+    for g in groups[:FAILURE_GROUPS]:
+        where = sorted(g["where"].items(), key=lambda kv: -kv[1])
+        where_text = " · ".join(w for w, _ in where[:3])
+        if len(where) > 3:
+            where_text += f" · +{len(where) - 3} more"
+        link = ""
+        if repo:
+            url = f"https://github.com/{repo}/actions/runs/{g['run_id']}/job/{g['job_id']}"
+            link = f' · <a href="{charts.esc(url)}" rel="noreferrer">open job ↗</a>'
+        excerpt = f"<pre>{charts.esc(g['excerpt'])}</pre>" if g["excerpt"] else ""
+        items.append(
+            f'<li><span class="n" title="failed jobs">{g["count"]:,}</span><div>'
+            f'<details><summary>{charts.esc(g["reason"])}</summary>{excerpt}'
+            f'<p class="muted">latest {charts.esc((g["last_seen"] or "")[:10])}{link}</p></details>'
+            f'<p class="where">{charts.esc(where_text)}</p>'
+            "</div></li>"
+        )
+
+    notes = []
+    rest = groups[FAILURE_GROUPS:]
+    if rest:
+        notes.append(f"{len(rest)} rarer reasons ({sum(g['count'] for g in rest):,} failures) not shown")
+    if data["knock_on"]:
+        notes.append(f"{data['knock_on']:,} knock-on failures left out — jobs that failed only after "
+                     "an earlier job in the same run had failed or been cancelled")
+    if data["no_log"]:
+        notes.append(f"{data['no_log']:,} with no log left on GitHub")
+    if data["pending"]:
+        notes.append(f"{data['pending']:,} not diagnosed yet")
+    note_html = f'<p class="muted">{charts.esc("; ".join(notes))}.</p>' if notes else ""
+
+    return f'{head}<ol class="reasons">{"".join(items)}</ol>{note_html}</section>'
 
 
 # --- local build charts -----------------------------------------------------
@@ -444,6 +500,21 @@ svg{display:block;width:100%;height:auto;margin-top:10px;min-width:640px}
   white-space:pre-wrap;line-height:1.5}
 .ask .a.wait{color:var(--muted);font-style:italic}
 .ask .a.err{border-color:var(--s5);color:var(--s5)}
+.reasons{list-style:none;margin:12px 0 8px;padding:0;font-size:13px}
+.reasons li{display:grid;grid-template-columns:3.2em minmax(0,1fr);gap:10px;padding:9px 0;
+  border-top:1px solid var(--line)}
+.reasons .n{text-align:right;font-variant-numeric:tabular-nums;font-size:15px;font-weight:600;line-height:1.35}
+.reasons .where{margin:3px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.reasons summary{overflow-wrap:anywhere}
+.failures summary{cursor:pointer}
+.failures pre{margin:8px 0 4px;padding:8px 10px;background:var(--bg);border:1px solid var(--line);
+  border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
+.failures a{color:var(--s0)}
+.muted{color:var(--muted);font-size:12px}
+.failures .muted{margin:4px 0}
+.failures code{font-size:12px;padding:1px 5px;border-radius:4px;background:var(--line)}
+.empty-note{color:var(--muted);font-size:13px}
 .key{display:inline-flex;align-items:center;gap:6px}
 .key i{width:11px;height:11px;border-radius:2px;display:inline-block}
 footer{margin-top:44px;color:var(--muted);font-size:12px}
@@ -619,7 +690,7 @@ _ASK_JS = """
 
 
 def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
-           ask: dict | None = None) -> str:
+           ask: dict | None = None, repo: str | None = None) -> str:
     runs = conn.execute(
         "SELECT * FROM ci_run WHERE project = ? ORDER BY created_at", (project,)
     ).fetchall()
@@ -645,7 +716,13 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
         local_cache_chart("c9", builds, local_weeks),
         local_config_cache_chart("c10", builds, local_weeks),
     ]
-    ci_section = "".join(c.html for c in ci_charts)
+    # The reasons table sits right under "Failures by job": the chart says
+    # which job, the table says what went wrong in it.
+    ci_section = (
+        "".join(c.html for c in ci_charts[:5])
+        + ci_failure_reasons(conn, project, repo)
+        + "".join(c.html for c in ci_charts[5:])
+    )
     local_section = "".join(c.html for c in local_charts)
 
     ids = [f"c{i}" for i in range(1, len(ci_charts) + len(local_charts) + 1)]

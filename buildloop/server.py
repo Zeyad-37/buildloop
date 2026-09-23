@@ -91,6 +91,7 @@ class _Handler(BaseHTTPRequestHandler):
                     conn, name, insights.load_cached(conn, name),
                     ask={"project": name, "token": self.server.token,
                          "available": claude_cli.available()},
+                    repo=self.server.config.project(name).github_repo,
                 )
             return self._html(HTTPStatus.OK, page)
         return self._text(HTTPStatus.NOT_FOUND, "not found")

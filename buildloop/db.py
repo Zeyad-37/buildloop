@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS ci_job (
     started_at   TEXT,
     completed_at TEXT,
     duration_ms  INTEGER,
-    runner       TEXT
+    runner       TEXT,
+    run_attempt  INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_ci_job_run     ON ci_job (run_id);
 CREATE INDEX IF NOT EXISTS ix_ci_job_project ON ci_job (project, started_at);
@@ -62,6 +63,19 @@ CREATE TABLE IF NOT EXISTS ci_step (
     PRIMARY KEY (job_id, number)
 );
 CREATE INDEX IF NOT EXISTS ix_ci_step_project ON ci_step (project, name);
+
+-- Why a failed job failed, read from its log. One row per failed job once
+-- diagnosed; the row existing is what stops it being fetched again, so a job
+-- whose log has expired still gets a row, with a NULL reason.
+CREATE TABLE IF NOT EXISTS ci_failure (
+    job_id    INTEGER PRIMARY KEY,
+    project   TEXT    NOT NULL,
+    step      TEXT,
+    reason    TEXT,
+    signature TEXT,
+    excerpt   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ci_failure_project ON ci_failure (project, signature);
 
 CREATE TABLE IF NOT EXISTS gradle_build (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +123,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"(supports {SCHEMA_VERSION}) — upgrade the tool"
         )
     conn.executescript(_SCHEMA)
+    # v2: ci_job.run_attempt. A fresh database gets it from the CREATE above;
+    # an existing one needs the column added.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(ci_job)")}
+    if "run_attempt" not in columns:
+        conn.execute("ALTER TABLE ci_job ADD COLUMN run_attempt INTEGER")
     # Future migrations append here, guarded on `version`.
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -170,17 +189,20 @@ def upsert_job(conn: sqlite3.Connection, row: dict) -> None:
     conn.execute(
         """
         INSERT INTO ci_job (job_id, run_id, project, name, conclusion,
-                            started_at, completed_at, duration_ms, runner)
+                            started_at, completed_at, duration_ms, runner,
+                            run_attempt)
         VALUES (:job_id, :run_id, :project, :name, :conclusion,
-                :started_at, :completed_at, :duration_ms, :runner)
+                :started_at, :completed_at, :duration_ms, :runner,
+                :run_attempt)
         ON CONFLICT(job_id) DO UPDATE SET
             conclusion   = excluded.conclusion,
             started_at   = excluded.started_at,
             completed_at = excluded.completed_at,
             duration_ms  = excluded.duration_ms,
-            runner       = excluded.runner
+            runner       = excluded.runner,
+            run_attempt  = excluded.run_attempt
         """,
-        row,
+        {"run_attempt": None, **row},
     )
 
 
@@ -196,6 +218,101 @@ def upsert_step(conn: sqlite3.Connection, row: dict) -> None:
         """,
         row,
     )
+
+
+def upsert_failure(conn: sqlite3.Connection, row: dict) -> None:
+    conn.execute(
+        """
+        INSERT INTO ci_failure (job_id, project, step, reason, signature, excerpt)
+        VALUES (:job_id, :project, :step, :reason, :signature, :excerpt)
+        ON CONFLICT(job_id) DO UPDATE SET
+            step      = excluded.step,
+            reason    = excluded.reason,
+            signature = excluded.signature,
+            excerpt   = excluded.excerpt
+        """,
+        row,
+    )
+
+
+# --- queries ----------------------------------------------------------------
+
+def knock_on(r: sqlite3.Row, run: list[sqlite3.Row]) -> bool:
+    """Did ``r`` start only after another unhappy job in its run had finished?
+
+    Jobs from a different attempt of the run are not its upstream: a re-run
+    that fails again is the flaky pattern worth seeing, not a knock-on of the
+    first attempt. Rows stored before the attempt was recorded (NULL) are
+    compared as before.
+    """
+    return any(
+        o["job_id"] != r["job_id"] and o["completed_at"] and r["started_at"]
+        and o["completed_at"] <= r["started_at"]
+        and (o["run_attempt"] is None or r["run_attempt"] is None
+             or o["run_attempt"] == r["run_attempt"])
+        for o in run
+    )
+
+
+def failure_groups(conn: sqlite3.Connection, project: str, since: str) -> dict:
+    """Diagnosed failures since ``since``, grouped by what went wrong.
+
+    A job that failed only because an earlier job in the same run failed or
+    was cancelled — a required-checks gate, a deploy that `needs:` the build —
+    is a knock-on, not a cause. Counting it would put the gate at the top of
+    the table every time the build breaks or a newer push supersedes it, so
+    knock-ons are counted separately. "Earlier" is by timestamp (it started
+    after the other finished), which is what `needs:` produces without
+    buildloop having to read workflow files.
+
+    Known limitation: an independent job that sat in a runner queue (a busy
+    macOS pool, say) until after an unrelated job in the run had failed looks
+    exactly like a `needs:` dependent, and is counted as a knock-on too. Telling
+    them apart needs the workflow's dependency graph.
+    """
+    unhappy = conn.execute(
+        """
+        SELECT j.job_id, j.run_id, j.run_attempt, j.name AS job, j.conclusion,
+               j.started_at, j.completed_at,
+               f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt
+        FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
+        WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
+          AND j.started_at >= ?
+        ORDER BY j.started_at DESC
+        """,
+        (project, since),
+    ).fetchall()
+    failed = [r for r in unhappy if r["conclusion"] == "failure"]
+
+    by_run: dict[int, list[sqlite3.Row]] = {}
+    for r in unhappy:
+        by_run.setdefault(r["run_id"], []).append(r)
+
+    groups: dict[str, dict] = {}
+    out = {"groups": [], "knock_on": 0, "no_log": 0, "pending": 0, "total": len(failed)}
+    for r in failed:  # newest first, so a group's first row is its latest
+        if r["diagnosed"] is None:
+            out["pending"] += 1
+            continue
+        if knock_on(r, by_run[r["run_id"]]):
+            out["knock_on"] += 1
+            continue
+        if not r["signature"]:
+            out["no_log"] += 1
+            continue
+        g = groups.get(r["signature"])
+        if g is None:
+            g = groups[r["signature"]] = {
+                "reason": r["reason"], "excerpt": r["excerpt"], "count": 0, "where": {},
+                "last_seen": r["started_at"], "run_id": r["run_id"], "job_id": r["job_id"],
+            }
+        g["count"] += 1
+        where = f"{r['job']} › {r['step']}" if r["step"] else r["job"]
+        g["where"][where] = g["where"].get(where, 0) + 1
+    # Groups were created newest first and the sort is stable, so equal
+    # counts stay newest first.
+    out["groups"] = sorted(groups.values(), key=lambda g: -g["count"])
+    return out
 
 
 def mark_jobs_synced(conn: sqlite3.Connection, run_id: int) -> None:

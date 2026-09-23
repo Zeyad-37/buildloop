@@ -67,7 +67,8 @@ def cmd_refresh(args) -> int:
             )
 
             out = cfg.home / f"dashboard-{project.name}.html"
-            out.write_text(dashboard.render(conn, project.name, analysis), encoding="utf-8")
+            out.write_text(dashboard.render(conn, project.name, analysis,
+                                            repo=project.github_repo), encoding="utf-8")
             outputs.append(out)
             print(f"  dashboard: {out}")
 

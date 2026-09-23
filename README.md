@@ -51,7 +51,9 @@ Put `bin/` on your `PATH` (or symlink `bin/buildloop` into `~/bin`) to drop the
 
 The first refresh backfills all available CI history — a few thousand runs,
 about a minute — then fetches per-job and per-step detail for the last 90 days,
-which takes a handful of minutes. Later refreshes are incremental and near
+and reads the log of every failed job in that window to say why it failed,
+which takes a handful of minutes. The log pass stays under your remaining
+hourly GitHub API budget; anything it can't fit waits for the next refresh. Later refreshes are incremental and near
 instant.
 
 ### Configuration
@@ -108,6 +110,7 @@ that looks meaningful and is not.
 | Queue time vs execution time | Is it us, or is it GitHub? |
 | Failure rate per week | Is CI getting flakier? |
 | Failures by job (90d) | *Which* job is the flaky one? |
+| Why CI fails (90d) | *What* went wrong — the error from each failed job's log, grouped |
 | Slowest steps (90d) | *Where* inside that job? |
 
 **Local Gradle**
