@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS ci_step (
 );
 CREATE INDEX IF NOT EXISTS ix_ci_step_project ON ci_step (project, name);
 
+-- Why a failed job failed, read from its log. One row per failed job once
+-- diagnosed; the row existing is what stops it being fetched again, so a job
+-- whose log has expired still gets a row, with a NULL reason.
+CREATE TABLE IF NOT EXISTS ci_failure (
+    job_id    INTEGER PRIMARY KEY,
+    project   TEXT    NOT NULL,
+    step      TEXT,
+    reason    TEXT,
+    signature TEXT,
+    excerpt   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ci_failure_project ON ci_failure (project, signature);
+
 CREATE TABLE IF NOT EXISTS gradle_build (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     project        TEXT    NOT NULL,
@@ -193,6 +206,21 @@ def upsert_step(conn: sqlite3.Connection, row: dict) -> None:
             name        = excluded.name,
             conclusion  = excluded.conclusion,
             duration_ms = excluded.duration_ms
+        """,
+        row,
+    )
+
+
+def upsert_failure(conn: sqlite3.Connection, row: dict) -> None:
+    conn.execute(
+        """
+        INSERT INTO ci_failure (job_id, project, step, reason, signature, excerpt)
+        VALUES (:job_id, :project, :step, :reason, :signature, :excerpt)
+        ON CONFLICT(job_id) DO UPDATE SET
+            step      = excluded.step,
+            reason    = excluded.reason,
+            signature = excluded.signature,
+            excerpt   = excluded.excerpt
         """,
         row,
     )

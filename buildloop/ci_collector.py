@@ -19,10 +19,11 @@ problem from one that slowed because the build got slower.
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from . import db, gh
+from . import db, failures, gh
 from .config import Project
 
 #: GitHub caps any single Actions-runs query at 1000 results regardless of
@@ -41,18 +42,29 @@ JOB_WINDOW_DAYS = 90
 
 TERMINAL_STATUS = "completed"
 
+#: Concurrent log downloads. Each is a `gh` subprocess waiting on the network;
+#: a few at a time cuts a first backfill by that factor while staying well
+#: clear of GitHub's secondary rate limits on concurrent requests.
+FAILURE_FETCH_WORKERS = 6
+
+#: Requests left untouched for everything else using the same `gh` token. The
+#: first diagnosis pass on a busy repo can want thousands of requests; it
+#: takes what fits under this and finishes on later refreshes.
+RATE_LIMIT_RESERVE = 1000
+
 
 @dataclass
 class CollectStats:
     runs: int = 0
     jobs: int = 0
     steps: int = 0
+    failures: int = 0
     requests: int = 0
 
     def __str__(self) -> str:
         return (
-            f"{self.runs} runs, {self.jobs} jobs, {self.steps} steps "
-            f"({self.requests} API requests)"
+            f"{self.runs} runs, {self.jobs} jobs, {self.steps} steps, "
+            f"{self.failures} failures diagnosed ({self.requests} API requests)"
         )
 
 
@@ -269,6 +281,8 @@ def collect(conn: sqlite3.Connection, project: Project, *, log=print,
 
     _collect_jobs(conn, project, stats, log, job_window_days)
     conn.commit()
+    _collect_failures(conn, project, stats, log, job_window_days)
+    conn.commit()
     return stats
 
 
@@ -318,3 +332,66 @@ def _iter_jobs(repo: str, run_id: int, stats: CollectStats):
         if len(jobs) < PAGE_SIZE:
             return
         page += 1
+
+
+def _collect_failures(conn, project: Project, stats: CollectStats, log, window_days: int) -> None:
+    """Read the log of every failed job not yet diagnosed.
+
+    Two requests per failed job — the job, for its step timings, and the log.
+    Only failures cost anything, and each is diagnosed once, so after the
+    first refresh this is a handful of requests. The first refresh has every
+    failure in the window to read, so fetches run a few at a time; database
+    writes stay on this thread. Newest first, committed as it goes, so an
+    interrupted first run keeps what it did.
+    """
+    pending = [r["job_id"] for r in conn.execute(
+        """
+        SELECT j.job_id FROM ci_job j
+        LEFT JOIN ci_failure f ON f.job_id = j.job_id
+        WHERE j.project = ? AND j.conclusion = 'failure' AND j.started_at >= ?
+          AND f.job_id IS NULL
+        ORDER BY j.started_at DESC
+        """,
+        (project.name, _iso_days_ago(window_days)),
+    ).fetchall()]
+    if not pending:
+        return
+    remaining = gh.rate_limit_remaining()
+    if remaining is not None:
+        budget = max(0, (remaining - RATE_LIMIT_RESERVE) // 2)
+        if budget < len(pending):
+            log(f"  failures: {len(pending) - budget} left for a later refresh "
+                f"({remaining} API requests left this hour)")
+            pending = pending[:budget]
+        if not pending:
+            return
+    log(f"  failures: reading logs for {len(pending)} failed job(s)")
+
+    repo = project.github_repo
+
+    def diagnose(job_id: int) -> dict:
+        try:
+            raw_job = gh.api(f"repos/{repo}/actions/jobs/{job_id}")
+        except gh.GhNotFound:
+            raw_job = {}
+        try:
+            text = gh.api_text(f"repos/{repo}/actions/jobs/{job_id}/logs")
+        except gh.GhNotFound:
+            text = None  # expired: keep the failing step, never ask again
+        return {"job_id": job_id, "project": project.name,
+                **failures.diagnose(raw_job, text)}  # type: ignore[arg-type]
+
+    with ThreadPoolExecutor(max_workers=FAILURE_FETCH_WORKERS) as pool:
+        try:
+            for i, row in enumerate(pool.map(diagnose, pending), 1):
+                stats.requests += 2
+                db.upsert_failure(conn, row)
+                stats.failures += 1
+                if i % 25 == 0:
+                    log(f"    {i}/{len(pending)} failures…")
+                    conn.commit()
+        except gh.GhRateLimited:
+            # Everything diagnosed so far is kept; the rest are still pending
+            # and the next refresh picks them up. Not worth failing CI over.
+            pool.shutdown(cancel_futures=True)
+            log(f"  failures: rate-limited after {stats.failures}; the rest resume next refresh")
