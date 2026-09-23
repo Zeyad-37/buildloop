@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -112,6 +113,21 @@ class TestExtraction(unittest.TestCase):
         self.assertEqual(d["step"], "Build")
         self.assertIsNone(d["reason"])
 
+    def test_a_url_is_not_shortened_like_a_path(self):
+        text = log(("10:01:00", "fatal: unable to access https://github.com/o/r.git/: 403"))
+        self.assertEqual(self.reason(text), "fatal: unable to access https://github.com/o/r.git/: 403")
+
+    def test_a_runner_path_is_still_shortened(self):
+        text = log(("10:01:00", "##[error]Missing /home/runner/work/App/App/build/report.xml"))
+        self.assertEqual(self.reason(text), "Missing report.xml")
+
+    def test_a_byte_order_mark_does_not_unscope_the_first_line(self):
+        j = job(("Check", "failure", "10:00:00", "10:00:10"),
+                ("Post", "success", "10:00:11", "10:00:20"))
+        text = "\ufeff" + log(("10:00:05", "##[error]Real reason"),
+                              ("10:00:15", "##[error]Cleanup noise"))
+        self.assertEqual(self.reason(text, j), "Real reason")
+
     def test_unscopable_step_uses_the_whole_log(self):
         text = log(("08:00:00", "##[error]Runner lost"))
         self.assertEqual(failures.diagnose({}, text)["reason"], "Runner lost")
@@ -126,6 +142,10 @@ class TestSignature(unittest.TestCase):
     def test_commit_shas_are_ignored(self):
         self.assertEqual(failures.signature("could not apply ab7b641... x"),
                          failures.signature("could not apply cf02794... x"))
+
+    def test_hex_looking_words_are_not_shas(self):
+        self.assertEqual(failures.signature("effaced and defaced"), "effaced and defaced")
+        self.assertEqual(failures.signature("at abc1234"), "at <sha>")
 
     def test_different_failures_stay_apart(self):
         self.assertNotEqual(failures.signature("Detekt found new issues"),
@@ -145,11 +165,11 @@ class DbCase(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def add_job(self, job_id, run_id, name, start, end, conclusion="failure"):
+    def add_job(self, job_id, run_id, name, start, end, conclusion="failure", attempt=None):
         db.upsert_job(self.conn, {
             "job_id": job_id, "run_id": run_id, "project": "p", "name": name,
             "conclusion": conclusion, "started_at": ago(start), "completed_at": ago(end),
-            "duration_ms": 1, "runner": "ubuntu-latest",
+            "duration_ms": 1, "runner": "ubuntu-latest", "run_attempt": attempt,
         })
 
     def add_failure(self, job_id, reason, step="Build", excerpt="ctx"):
@@ -160,6 +180,9 @@ class DbCase(unittest.TestCase):
 
 
 class TestFailureGroups(DbCase):
+    def groups(self):
+        return db.failure_groups(self.conn, "p", ago(60 * 24 * 90))
+
     def test_groups_by_signature_and_skips_knock_ons(self):
         # Run 1: build fails, then the required-checks gate fails because of it.
         self.add_job(1, 1, "build", 60, 50)
@@ -170,7 +193,7 @@ class TestFailureGroups(DbCase):
         self.add_job(3, 2, "build", 30, 20)
         self.add_failure(3, "Coverage regressed: 11 < 14")
 
-        data = dashboard.failure_groups(self.conn, "p")
+        data = self.groups()
         self.assertEqual(data["knock_on"], 1)
         self.assertEqual(len(data["groups"]), 1)
         g = data["groups"][0]
@@ -183,8 +206,52 @@ class TestFailureGroups(DbCase):
         self.add_job(1, 1, "build", 60, 50, conclusion="cancelled")
         self.add_job(2, 1, "required-checks", 49, 48)
         self.add_failure(2, "Required job 'build' concluded with 'cancelled'")
-        data = dashboard.failure_groups(self.conn, "p")
+        data = self.groups()
         self.assertEqual((data["knock_on"], data["groups"], data["total"]), (1, [], 1))
+
+    def test_a_rerun_that_fails_again_is_a_cause_not_a_knock_on(self):
+        # Attempt 1 failed; attempt 2 of the same run started later and failed too.
+        self.add_job(1, 1, "build", 60, 50, attempt=1)
+        self.add_job(2, 1, "build", 40, 30, attempt=2)
+        self.add_failure(1, "Flaky: socket timeout")
+        self.add_failure(2, "Flaky: socket timeout")
+        data = self.groups()
+        self.assertEqual(data["knock_on"], 0)
+        self.assertEqual(data["groups"][0]["count"], 2)
+
+    def test_a_gate_in_the_same_attempt_is_still_a_knock_on(self):
+        self.add_job(1, 1, "build", 60, 50, conclusion="cancelled", attempt=2)
+        self.add_job(2, 1, "required-checks", 49, 48, attempt=2)
+        self.add_failure(2, "Required job 'build' concluded with 'cancelled'")
+        self.assertEqual(self.groups()["knock_on"], 1)
+
+    def test_rows_without_an_attempt_keep_the_timestamp_rule(self):
+        # Stored before run_attempt existed: one side unknown, so compared as before.
+        self.add_job(1, 1, "build", 60, 50, attempt=1)
+        self.add_job(2, 1, "build", 40, 30)
+        self.add_failure(1, "Flaky: socket timeout")
+        self.add_failure(2, "Flaky: socket timeout")
+        self.assertEqual(self.groups()["knock_on"], 1)
+
+    def test_known_limitation_a_queued_independent_job_counts_as_a_knock_on(self):
+        # "lint" does not need "build"; it just waited for a runner until after
+        # build had failed. Without the workflow graph this looks like needs:,
+        # so it is (wrongly) left out. Pinned so a fix shows up as a change.
+        self.add_job(1, 1, "build", 60, 50, attempt=1)
+        self.add_job(2, 1, "lint", 45, 40, attempt=1)
+        self.add_failure(1, "Compile error: x")
+        self.add_failure(2, "Detekt found issues")
+        data = self.groups()
+        self.assertEqual(data["knock_on"], 1)
+        self.assertEqual([g["reason"] for g in data["groups"]], ["Compile error: x"])
+
+    def test_equal_counts_list_the_most_recent_first(self):
+        self.add_job(1, 1, "build", 60, 50)
+        self.add_job(2, 2, "build", 30, 20)
+        self.add_failure(1, "Old failure")
+        self.add_failure(2, "New failure")
+        self.assertEqual([g["reason"] for g in self.groups()["groups"]],
+                         ["New failure", "Old failure"])
 
     def test_parallel_failures_are_both_causes(self):
         # Two jobs that ran side by side each failed on their own.
@@ -192,7 +259,7 @@ class TestFailureGroups(DbCase):
         self.add_job(2, 1, "ios", 60, 45)
         self.add_failure(1, "Detekt found issues")
         self.add_failure(2, "Link failed")
-        data = dashboard.failure_groups(self.conn, "p")
+        data = self.groups()
         self.assertEqual(data["knock_on"], 0)
         self.assertEqual(len(data["groups"]), 2)
 
@@ -200,7 +267,7 @@ class TestFailureGroups(DbCase):
         self.add_job(1, 1, "build", 60, 50)
         self.add_job(2, 2, "build", 40, 30)
         self.add_failure(2, None)
-        data = dashboard.failure_groups(self.conn, "p")
+        data = self.groups()
         self.assertEqual((data["pending"], data["no_log"], data["groups"]), (1, 1, []))
 
     def test_table_escapes_log_text_and_links_the_job(self):
@@ -253,7 +320,7 @@ class TestCollectFailures(DbCase):
         rows = {r["job_id"]: r["reason"] for r in self.conn.execute("SELECT * FROM ci_failure")}
         self.assertEqual(rows, {1: "Boom", 2: None})
 
-    def run_pass(self, remaining, fail_on=None):
+    def run_pass(self, remaining, fail_on=None, error=gh.GhRateLimited):
         project = ci.Project(name="p", github_repo="o/r", gradle_root=None)
         calls = []
 
@@ -263,7 +330,7 @@ class TestCollectFailures(DbCase):
         def fake_text(path):
             calls.append(path)
             if fail_on and fail_on in path:
-                raise gh.GhRateLimited(path)
+                raise error(path)
             return "2026-09-09T10:00:00.0Z ##[error]Boom"
 
         original = gh.api, gh.api_text, gh.rate_limit_remaining
@@ -292,6 +359,47 @@ class TestCollectFailures(DbCase):
         stats = self.run_pass(None)
         done = self.conn.execute("SELECT COUNT(*) FROM ci_failure").fetchone()[0]
         self.assertEqual(done, 2)
+
+    def test_one_unreadable_job_is_skipped_not_fatal(self):
+        self.add_job(1, 1, "build", 60, 50)
+        self.add_job(2, 2, "build", 40, 30)
+        stats = self.run_pass(None, fail_on="/jobs/2/", error=gh.GhError)
+        self.assertEqual(stats.failures, 1)
+        rows = [r["job_id"] for r in self.conn.execute("SELECT job_id FROM ci_failure")]
+        self.assertEqual(rows, [1])
+        stats = self.run_pass(None)  # healthy again: only the skipped one is read
+        self.assertEqual(stats.failures, 1)
+        done = self.conn.execute("SELECT COUNT(*) FROM ci_failure").fetchone()[0]
+        self.assertEqual(done, 2)
+
+
+class TestSchema(unittest.TestCase):
+    def test_a_v1_database_gains_run_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite"
+            old = sqlite3.connect(path)
+            old.executescript("""
+                CREATE TABLE ci_job (job_id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL,
+                    project TEXT NOT NULL, name TEXT NOT NULL, conclusion TEXT,
+                    started_at TEXT, completed_at TEXT, duration_ms INTEGER, runner TEXT);
+                INSERT INTO ci_job (job_id, run_id, project, name) VALUES (1, 1, 'p', 'build');
+                PRAGMA user_version = 1;
+            """)
+            old.close()
+            conn = db.connect(path)
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(ci_job)")}
+                self.assertIn("run_attempt", cols)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+                row = conn.execute("SELECT name, run_attempt FROM ci_job").fetchone()
+                self.assertEqual((row["name"], row["run_attempt"]), ("build", None))
+            finally:
+                conn.close()
+
+    def test_map_job_keeps_the_attempt(self):
+        raw = {"id": 5, "run_id": 1, "run_attempt": 2}
+        self.assertEqual(ci.map_job(raw, "p")["run_attempt"], 2)
+        self.assertIsNone(ci.map_job({"id": 5, "run_id": 1}, "p")["run_attempt"])
 
 
 if __name__ == "__main__":

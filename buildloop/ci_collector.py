@@ -150,6 +150,7 @@ def map_job(raw: dict, project: str) -> dict:
         "completed_at": completed,
         "duration_ms": delta_ms(started, completed),
         "runner": runner,
+        "run_attempt": int(raw["run_attempt"]) if raw.get("run_attempt") else None,
     }
 
 
@@ -369,7 +370,17 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
 
     repo = project.github_repo
 
-    def diagnose(job_id: int) -> dict:
+    def diagnose(job_id: int) -> dict | None:
+        try:
+            return _diagnose(job_id)
+        except gh.GhRateLimited:
+            raise
+        except gh.GhError:
+            # A 5xx that outlasted the retries, a 403, a log too big for gh:
+            # skip it this pass rather than stop at the same job every refresh.
+            return None
+
+    def _diagnose(job_id: int) -> dict:
         try:
             raw_job = gh.api(f"repos/{repo}/actions/jobs/{job_id}")
         except gh.GhNotFound:
@@ -381,10 +392,14 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
         return {"job_id": job_id, "project": project.name,
                 **failures.diagnose(raw_job, text)}  # type: ignore[arg-type]
 
+    skipped = 0
     with ThreadPoolExecutor(max_workers=FAILURE_FETCH_WORKERS) as pool:
         try:
             for i, row in enumerate(pool.map(diagnose, pending), 1):
                 stats.requests += 2
+                if row is None:
+                    skipped += 1
+                    continue
                 db.upsert_failure(conn, row)
                 stats.failures += 1
                 if i % 25 == 0:
@@ -395,3 +410,5 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
             # and the next refresh picks them up. Not worth failing CI over.
             pool.shutdown(cancel_futures=True)
             log(f"  failures: rate-limited after {stats.failures}; the rest resume next refresh")
+    if skipped:
+        log(f"  failures: {skipped} job(s) could not be read; retried next refresh")

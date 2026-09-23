@@ -16,7 +16,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
-from . import charts
+from . import charts, db
 from .charts import Chart, Series
 from .humanize import count, ms, pct
 
@@ -201,72 +201,10 @@ def ci_slow_steps_chart(cid, conn, project) -> Chart:
 FAILURE_GROUPS = 15
 
 
-def failure_groups(conn, project, since: str | None = None) -> dict:
-    """Diagnosed failures in the job window, grouped by what went wrong.
-
-    A job that failed only because an earlier job in the same run failed or
-    was cancelled — a required-checks gate, a deploy that `needs:` the build —
-    is a knock-on, not a cause. Counting it would put the gate at the top of
-    the table every time the build breaks or a newer push supersedes it, so
-    knock-ons are counted separately. "Earlier" is by timestamp (it started
-    after the other finished), which is what `needs:` produces without
-    buildloop having to read workflow files.
-    """
-    cutoff = since or (
-        datetime.now(timezone.utc) - timedelta(days=JOB_WINDOW_DAYS)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    unhappy = conn.execute(
-        """
-        SELECT j.job_id, j.run_id, j.name AS job, j.conclusion, j.started_at, j.completed_at,
-               f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt
-        FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
-        WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
-          AND j.started_at >= ?
-        ORDER BY j.started_at DESC
-        """,
-        (project, cutoff),
-    ).fetchall()
-    failed = [r for r in unhappy if r["conclusion"] == "failure"]
-
-    by_run: dict[int, list] = {}
-    for r in unhappy:
-        by_run.setdefault(r["run_id"], []).append(r)
-
-    def knock_on(r) -> bool:
-        return any(
-            o["job_id"] != r["job_id"] and o["completed_at"] and r["started_at"]
-            and o["completed_at"] <= r["started_at"]
-            for o in by_run[r["run_id"]]
-        )
-
-    groups: dict[str, dict] = {}
-    out = {"groups": [], "knock_on": 0, "no_log": 0, "pending": 0, "total": len(failed)}
-    for r in failed:  # newest first, so a group's first row is its latest
-        if r["diagnosed"] is None:
-            out["pending"] += 1
-            continue
-        if knock_on(r):
-            out["knock_on"] += 1
-            continue
-        if not r["signature"]:
-            out["no_log"] += 1
-            continue
-        g = groups.get(r["signature"])
-        if g is None:
-            g = groups[r["signature"]] = {
-                "reason": r["reason"], "excerpt": r["excerpt"], "count": 0, "where": {},
-                "last_seen": r["started_at"], "run_id": r["run_id"], "job_id": r["job_id"],
-            }
-        g["count"] += 1
-        where = f"{r['job']} › {r['step']}" if r["step"] else r["job"]
-        g["where"][where] = g["where"].get(where, 0) + 1
-    out["groups"] = sorted(groups.values(), key=lambda g: (-g["count"], g["last_seen"] or ""))
-    return out
-
-
-def ci_failure_reasons(conn, project, repo: str | None = None) -> str:
+def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None = None) -> str:
     """The table that says what the failures in "Failures by job" actually were."""
-    data = failure_groups(conn, project)
+    since = (datetime.now(timezone.utc) - timedelta(days=JOB_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = db.failure_groups(conn, project, since)
     head = (
         '<section class="chart failures" id="failures"><figcaption>'
         "<h3>Why CI fails</h3>"

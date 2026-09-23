@@ -26,7 +26,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from . import claude_cli, db
-from .dashboard import JOB_WINDOW_DAYS, failure_groups
+from .ci_collector import JOB_WINDOW_DAYS
 from .humanize import ms
 
 STATE_PREFIX = "insight:"
@@ -153,13 +153,13 @@ def _flaky_jobs(conn, project) -> list[dict]:
     ]
 
 
-def _failure_reasons(conn, project) -> dict:
+def _failure_reasons(conn: sqlite3.Connection, project: str) -> dict:
     """What the failures were, not just how many — read from job logs.
 
     The window is floored to the day, like every other window here, so the
     fingerprint only moves when a failure is added or ages out.
     """
-    data = failure_groups(conn, project, since=_iso_days_ago(JOB_WINDOW_DAYS))
+    data = db.failure_groups(conn, project, _iso_days_ago(JOB_WINDOW_DAYS))
     return {
         "window_days": JOB_WINDOW_DAYS,
         "top": [
