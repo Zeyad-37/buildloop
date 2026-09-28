@@ -27,3 +27,14 @@ def pct(value: float | None) -> str:
 
 def count(value: float | None) -> str:
     return "—" if value is None else f"{value:.0f}"
+
+
+def mins(value: float | None) -> str:
+    """A count of CI minutes. Kept in minutes rather than hours because that
+    is the unit GitHub's quota and invoices are stated in."""
+    return "—" if value is None else f"{value:,.0f} min"
+
+
+def mins_axis(value: float) -> str:
+    """Axis ticks for CI minutes: "7.5k min" where the exact form won't fit."""
+    return f"{value / 1000:g}k min" if value >= 1000 else f"{value:.0f} min"

@@ -53,5 +53,23 @@ class TestTooltipMetadata(unittest.TestCase):
         self.assertNotIn("<script>x", c.html)
 
 
+class TestXLabels(unittest.TestCase):
+    def test_never_more_than_the_limit(self):
+        for n in range(1, 60):
+            self.assertLessEqual(len(charts._x_labels([str(i) for i in range(n)])), 10, n)
+
+    def test_latest_is_always_labelled(self):
+        for n in range(1, 60):
+            self.assertEqual(charts._x_labels([str(i) for i in range(n)])[-1][0], n - 1, n)
+
+    def test_labels_stay_at_least_a_step_apart(self):
+        # 17 weeks used to label every one; 18 put the latest one slot from its
+        # neighbour. Either way the dates overprinted.
+        for n in (17, 18, 21, 44):
+            idx = [i for i, _ in charts._x_labels([str(i) for i in range(n)])]
+            step = -(-n // 10)
+            self.assertTrue(all(b - a >= step for a, b in zip(idx, idx[1:])), (n, idx))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,7 @@ that looks meaningful and is not.
 | Run duration (median) per workflow | Is CI getting slower? |
 | Run duration (p90) per workflow | Is it getting less predictable? |
 | Queue time vs execution time | Is it us, or is it GitHub? |
+| CI minutes per week, by runner OS | How much runner time is CI using? |
 | Failure rate per week | Is CI getting flakier? |
 | Failures by job (90d) | *Which* job is the flaky one? |
 | Why CI fails (90d) | *What* went wrong — the error from each failed job's log, grouped |
@@ -121,6 +122,15 @@ that looks meaningful and is not.
 | Slowest task sets | Which invocations cost me the day? |
 | Cache effectiveness | Is the build cache still earning its keep? |
 | Configuration-cache hit rate | Am I silently losing the config cache? |
+
+CI minutes are not run duration. A run's duration is wall-clock time; its
+minutes are the sum of its jobs' durations, each rounded up to the whole minute
+as GitHub bills them, so five parallel ten-minute jobs take ten minutes and use
+fifty. They are split by runner OS rather than priced, because macOS and Windows
+minutes bill at a higher rate than Linux and the price list is GitHub's, not
+buildloop's. Minutes come from job detail, so they start where the first
+refresh's 90-day job window did, and a job that was re-run counts only its
+latest attempt — the minutes the failed attempt used aren't collected.
 
 The local charts start empty — there is no way to recover builds that already
 happened, so give it a couple of weeks before the local half is interesting.
