@@ -151,7 +151,7 @@ def ci_queue_vs_exec_chart(cid, runs, weeks) -> Chart:
     )
 
 
-def ci_minutes_chart(cid, jobs) -> Chart:
+def ci_minutes_chart(cid: str, jobs: Iterable[sqlite3.Row]) -> Chart:
     """Runner minutes per week, stacked by runner OS.
 
     Its own axis, not the run history's: minutes come from job detail, which

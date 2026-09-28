@@ -25,6 +25,8 @@ first attempt.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
+from typing import Any
 
 LINUX, WINDOWS, MACOS, SELF_HOSTED, OTHER = "Linux", "Windows", "macOS", "self-hosted", "other"
 
@@ -76,7 +78,7 @@ def jobs(conn: sqlite3.Connection, project: str, since: str | None = None) -> li
     ).fetchall()
 
 
-def totals(rows) -> dict:
+def totals(rows: Iterable[sqlite3.Row]) -> dict[str, Any]:
     """Minutes in ``rows``: overall, by runner OS and by workflow.
 
     Both breakdowns are sorted largest first, and an OS with no minutes is

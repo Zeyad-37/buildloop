@@ -15,6 +15,7 @@ and the browser only positions strings.
 from __future__ import annotations
 
 import html
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 W, H = 900, 260
@@ -71,7 +72,8 @@ def _x_labels(categories: list[str], limit: int = 10) -> list[tuple[int, str]]:
     return [(i, categories[i]) for i in shown]
 
 
-def _axes(categories, y_max, y_fmt, *, x_slot_center: bool, axis_fmt=None) -> list[str]:
+def _axes(categories, y_max, y_fmt, *, x_slot_center: bool,
+          axis_fmt: Callable[[float], str] | None = None) -> list[str]:
     axis_fmt = axis_fmt or y_fmt
     n = max(len(categories), 1)
     plot_w = W - PAD_L - PAD_R
@@ -182,7 +184,7 @@ def line_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str
 
 
 def stacked_bar_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str,
-                      axis_fmt=None) -> Chart:
+                      axis_fmt: Callable[[float], str] | None = None) -> Chart:
     """Stacked bars — for compositions that must be read as a whole.
 
     ``axis_fmt``, if given, labels the y axis instead of ``y_fmt``, for values
