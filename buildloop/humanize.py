@@ -36,5 +36,11 @@ def mins(value: float | None) -> str:
 
 
 def mins_axis(value: float) -> str:
-    """Axis ticks for CI minutes: "7.5k min" where the exact form won't fit."""
-    return f"{value / 1000:g}k min" if value >= 1000 else f"{value:.0f} min"
+    """Axis ticks for CI minutes: "7.5k min" where the exact form won't fit.
+
+    Three significant digits at most ("18.8k min", not "18.75k min"), which
+    keeps every tick within the gutter; past a million it switches to "M".
+    """
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.3g}M min"
+    return f"{value / 1000:.3g}k min" if value >= 1000 else f"{value:.0f} min"

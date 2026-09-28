@@ -5,7 +5,7 @@ from pathlib import Path
 
 import support  # noqa: F401
 
-from buildloop import ask, dashboard, db, insights, minutes
+from buildloop import ask, charts, dashboard, db, insights, minutes
 from buildloop.humanize import mins, mins_axis
 
 
@@ -51,6 +51,17 @@ class TestBilled(unittest.TestCase):
         self.assertEqual(mins_axis(10_000), "10k min")
         self.assertEqual(mins_axis(7_500), "7.5k min")
         self.assertEqual(mins_axis(250), "250 min")
+        # Quarter ticks of a nice max like 25,000 land on 18,750.
+        self.assertEqual(mins_axis(18_750), "18.8k min")
+        self.assertEqual(mins_axis(1_875), "1.88k min")
+        self.assertEqual(mins_axis(1_875_000), "1.88M min")
+
+    def test_every_tick_of_a_nice_axis_fits(self):
+        for v in (1_000, 2_000, 2_500, 5_000, 10_000, 20_000, 25_000, 50_000, 100_000, 250_000):
+            m = charts._nice_max(v)
+            for i in range(5):
+                tick = mins_axis(m * (1 - i / 4))
+                self.assertLessEqual(len(tick), 9, f"{tick!r} on an axis to {m}")
 
 
 class _Db(unittest.TestCase):
