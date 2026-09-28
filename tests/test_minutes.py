@@ -132,6 +132,26 @@ class TestChart(_Db):
         meta = dashboard.ci_minutes_chart("c", minutes.jobs(self.conn, "p")).meta
         self.assertEqual([s["label"] for s in meta["series"]], [minutes.MACOS])
 
+    def test_an_os_only_in_the_dropped_week_gets_no_series(self):
+        # An empty legend key: macOS ran only in the partial first week.
+        self.add_run(14.01, jobs=[(60_000, "macos-latest")])
+        self.add_run(7.01, jobs=[(60_000, "ubuntu-latest")])
+        self.add_run(0.01, jobs=[(60_000, "ubuntu-latest")])
+        meta = dashboard.ci_minutes_chart("c", minutes.jobs(self.conn, "p")).meta
+        self.assertEqual([s["label"] for s in meta["series"]], [minutes.LINUX])
+
+    def test_still_running_only_when_the_last_bar_is_this_week(self):
+        self.add_run(15, jobs=[(60_000, "ubuntu-latest")])
+        self.add_run(8, jobs=[(60_000, "ubuntu-latest")])
+        html = dashboard.ci_minutes_chart("c", minutes.jobs(self.conn, "p")).html
+        self.assertNotIn("still running", html)
+
+        # Seconds ago, not minutes: it must land in this week even just past midnight on Monday.
+        self.add_run(7.0001, jobs=[(60_000, "ubuntu-latest")])
+        self.add_run(0.0001, jobs=[(60_000, "ubuntu-latest")])
+        html = dashboard.ci_minutes_chart("c", minutes.jobs(self.conn, "p")).html
+        self.assertIn("still running", html)
+
     def test_stat_counts_the_last_28_days(self):
         self.add_run(40, jobs=[(600_000, "ubuntu-latest")])
         self.add_run(1, jobs=[(120_000, "ubuntu-latest")])
@@ -159,6 +179,17 @@ class TestSummary(_Db):
         weekly = ask.build_context(self.conn, "p")["ci_minutes_weekly"]
         self.assertEqual(len(weekly), 2)
         self.assertEqual(weekly[-1]["total"], "1 min")
+
+    def test_ask_context_has_the_charts_weeks_gaps_included(self):
+        # A zero-minute week must be visible, or "fewest minutes?" is answered wrongly.
+        for weeks_back in (0, 2, 3):
+            self.add_run(7 * weeks_back + 0.01, jobs=[(60_000, "ubuntu-latest")])
+        weekly = ask.build_context(self.conn, "p")["ci_minutes_weekly"]
+        meta = dashboard.ci_minutes_chart("c", minutes.jobs(self.conn, "p")).meta
+        self.assertEqual([w["week_of"] for w in weekly], meta["categories"])
+        self.assertEqual(len(weekly), 3)
+        self.assertEqual(weekly[1]["total"], "0 min")
+        self.assertEqual(weekly[1]["by_runner_os"], {})
 
 
 if __name__ == "__main__":

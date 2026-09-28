@@ -15,7 +15,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from . import claude_cli, insights, minutes
-from .dashboard import percentile, week_start
+from .dashboard import percentile, week_start, weekly_jobs
 from .humanize import mins, ms
 
 MAX_QUESTION_CHARS = 500
@@ -58,17 +58,11 @@ def _weekly_ci(runs, weeks: set[str], workflows: list[str]) -> dict:
 
 
 def _weekly_minutes(conn: sqlite3.Connection, project: str, cutoff: str) -> list[dict]:
-    """Runner minutes per week. The earliest week is cut mid-week by either
-    the cutoff or the start of job detail, so it is dropped, as on the chart."""
-    buckets: dict[str, list] = {}
-    for j in minutes.jobs(conn, project, cutoff):
-        wk = week_start(j["started_at"])
-        if wk:
-            buckets.setdefault(wk, []).append(j)
-    weeks = sorted(buckets)
+    """Runner minutes per week, on exactly the chart's weeks (``weekly_jobs``):
+    gap weeks are present as zero, and the earliest, partial week is dropped."""
     out = []
-    for wk in weeks[1:] if len(weeks) > 1 else weeks:
-        t = minutes.totals(buckets[wk])
+    for wk, rows in weekly_jobs(minutes.jobs(conn, project, cutoff)):
+        t = minutes.totals(rows)
         out.append({
             "week_of": wk,
             "total": mins(t["total"]),

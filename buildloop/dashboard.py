@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 
 from . import charts, db, minutes
@@ -61,6 +62,26 @@ def _weeks_between(first: str, last: str) -> list[str]:
 def _axis(rows_weeks: list[str]) -> list[str]:
     weeks = [w for w in rows_weeks if w]
     return _weeks_between(min(weeks), max(weeks)) if weeks else []
+
+
+def weekly_jobs(jobs: Iterable[sqlite3.Row]) -> list[tuple[str, list[sqlite3.Row]]]:
+    """Jobs grouped by week, for the minutes chart and the question box alike.
+
+    Every week in range is present, empty ones included: a week with no jobs
+    is information, and leaving it out lets "which week used the fewest
+    minutes?" be answered wrongly. The earliest week is dropped when there is
+    more than one — it is cut mid-week by the job window or the cutoff, and a
+    sum over a partial week reads as a quiet week, which it wasn't.
+    """
+    buckets: dict[str, list[sqlite3.Row]] = {}
+    for j in jobs:
+        wk = week_start(j["started_at"])
+        if wk:
+            buckets.setdefault(wk, []).append(j)
+    weeks = _axis(list(buckets))
+    if len(weeks) > 1:
+        weeks = weeks[1:]
+    return [(w, buckets.get(w, [])) for w in weeks]
 
 
 def _top_workflows(runs: list[sqlite3.Row], limit: int = 5) -> list[str]:
@@ -134,28 +155,25 @@ def ci_minutes_chart(cid, jobs) -> Chart:
     """Runner minutes per week, stacked by runner OS.
 
     Its own axis, not the run history's: minutes come from job detail, which
-    only goes back as far as the first refresh's job window. The first week of
-    that is cut mid-week by the window boundary, so it is dropped — a sum over
-    a partial week reads as a quiet week, which it wasn't.
+    only goes back as far as the first refresh's job window. See
+    ``weekly_jobs`` for why the first week is dropped.
     """
-    buckets: dict[str, dict[str, int]] = {}
-    for j in jobs:
-        wk = week_start(j["started_at"])
-        if wk:
-            by_os = buckets.setdefault(wk, {})
-            os_ = minutes.runner_os(j["runner"])
-            by_os[os_] = by_os.get(os_, 0) + minutes.billed(j["duration_ms"])
-    weeks = _axis(list(buckets))
-    if len(weeks) > 1:
-        weeks = weeks[1:]
-    present = [o for o in minutes.OS_ORDER if any(o in b for b in buckets.values())]
-    return charts.stacked_bar_chart(
-        cid, "CI minutes",
+    weekly = [(w, minutes.totals(rows)["by_os"]) for w, rows in weekly_jobs(jobs)]
+    weeks = [w for w, _ in weekly]
+    # Only over the weeks kept: an OS used only in the dropped first week
+    # would otherwise get a legend key with no bars.
+    present = [o for o in minutes.OS_ORDER if any(o in by_os for _, by_os in weekly)]
+    subtitle = (
         "Runner minutes per week, by runner OS: every job's duration, each rounded up to the whole "
         "minute as GitHub bills it. Parallel jobs add up, so this outgrows run duration. macOS and "
-        "Windows minutes are billed at a higher rate than Linux. This week is still running.",
-        weeks,
-        [Series(o, [(w, buckets.get(w, {}).get(o)) for w in weeks]) for o in present],
+        "Windows minutes are billed at a higher rate than Linux."
+    )
+    # The axis ends at the latest week with jobs, which is not necessarily this one.
+    if weeks and weeks[-1] == week_start(datetime.now(timezone.utc).isoformat()):
+        subtitle += " This week is still running."
+    return charts.stacked_bar_chart(
+        cid, "CI minutes", subtitle, weeks,
+        [Series(o, [(w, by_os.get(o)) for w, by_os in weekly]) for o in present],
         mins, axis_fmt=mins_axis,
     )
 
