@@ -129,8 +129,10 @@ as GitHub bills them, so five parallel ten-minute jobs take ten minutes and use
 fifty. They are split by runner OS rather than priced, because macOS and Windows
 minutes bill at a higher rate than Linux and the price list is GitHub's, not
 buildloop's. Minutes come from job detail, so they start where the first
-refresh's 90-day job window did, and a job that was re-run counts only its
-latest attempt — the minutes the failed attempt used aren't collected.
+refresh's 90-day job window did. Re-runs are counted as refreshes saw them: a
+run first collected after its re-run counts only the latest attempt, one
+re-synced while its re-run was going keeps every attempt it saw, and one
+re-run between refreshes counts only its first attempt.
 
 The local charts start empty — there is no way to recover builds that already
 happened, so give it a couple of weeks before the local half is interesting.

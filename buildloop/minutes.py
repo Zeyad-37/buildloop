@@ -12,9 +12,14 @@ macOS and Windows minutes are billed at a higher rate than Linux, and the rates
 belong to GitHub's price list, which changes, not to this tool.
 
 Computed from ``ci_job``, so it covers the rolling job window plus whatever has
-accumulated since the first refresh — not the full run history. Jobs are
-fetched with ``filter=latest``, so a job that was re-run counts only its latest
-attempt; the minutes its earlier attempts used are not counted.
+accumulated since the first refresh — not the full run history. Re-runs are
+counted as refreshes observed them. Jobs are fetched per run with
+``filter=latest`` and stored by ``job_id``, a re-run attempt gets new job IDs,
+and a run is only re-fetched while it is unsynced or not yet completed. So a
+run first collected after its re-run counts only its latest attempt; one
+collected before the re-run and re-synced while it was running keeps every
+attempt it saw; one whose re-run finished between refreshes counts only its
+first attempt.
 """
 
 from __future__ import annotations
