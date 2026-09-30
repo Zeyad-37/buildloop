@@ -152,20 +152,21 @@ def ci_failure_rate_chart(cid, runs, weeks, workflows) -> Chart:
     )
 
 
-def ci_flaky_jobs_chart(cid, conn, project) -> Chart:
+def ci_flaky_jobs_chart(cid, conn, project, exclude_budget: bool = False) -> Chart:
     rows = conn.execute(
         """
-        SELECT name,
-               SUM(CASE WHEN conclusion = 'failure' THEN 1 ELSE 0 END) AS failures,
+        SELECT j.name,
+               SUM(CASE WHEN j.conclusion = 'failure' THEN 1 ELSE 0 END) AS failures,
                COUNT(*) AS total
-        FROM ci_job
-        WHERE project = ? AND conclusion IS NOT NULL
-        GROUP BY name
+        FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
+        WHERE j.project = ? AND j.conclusion IS NOT NULL
+          AND NOT (? AND COALESCE(f.cause, '') = ?)
+        GROUP BY j.name
         HAVING failures > 0
         ORDER BY failures DESC
         LIMIT ?
         """,
-        (project, TOP_N),
+        (project, exclude_budget, db.BUDGET, TOP_N),
     ).fetchall()
     return charts.hbar_chart(
         cid, "Failures by job",
@@ -201,12 +202,13 @@ def ci_slow_steps_chart(cid, conn, project) -> Chart:
 FAILURE_GROUPS = 15
 
 
-def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None = None) -> str:
+def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None = None,
+                       exclude_budget: bool = False, sid: str = "failures") -> str:
     """The table that says what the failures in "Failures by job" actually were."""
     since = (datetime.now(timezone.utc) - timedelta(days=JOB_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    data = db.failure_groups(conn, project, since)
+    data = db.failure_groups(conn, project, since, exclude_budget=exclude_budget)
     head = (
-        '<section class="chart failures" id="failures"><figcaption>'
+        f'<section class="chart failures" id="{charts.esc(sid)}"><figcaption>'
         "<h3>Why CI fails</h3>"
         f"<p>Failed jobs in the last {JOB_WINDOW_DAYS} days, grouped by the error in the failing "
         "step's log. The same failure with different numbers counts once. Expand a row for the "
@@ -214,7 +216,8 @@ def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None 
     )
     groups = data["groups"]
     if not groups:
-        msg = ("No failed jobs in this window." if not data["total"]
+        left = data["total"] - (data["budget"] if exclude_budget else 0)
+        msg = ("No failed jobs in this window." if not left
                else "Failures are recorded but none have been diagnosed yet — run "
                     "<code>buildloop refresh</code>.")
         return f'{head}<p class="empty-note">{msg}</p></section>'
@@ -242,6 +245,8 @@ def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None 
     rest = groups[FAILURE_GROUPS:]
     if rest:
         notes.append(f"{len(rest)} rarer reasons ({sum(g['count'] for g in rest):,} failures) not shown")
+    if exclude_budget and data["budget"]:
+        notes.append(f"{data['budget']:,} jobs an Actions budget kept from starting left out")
     if data["knock_on"]:
         notes.append(f"{data['knock_on']:,} knock-on failures left out — jobs that failed only after "
                      "an earlier job in the same run had failed or been cancelled")
@@ -407,7 +412,23 @@ def _stat(label: str, value: str, note: str = "") -> str:
     return f'<div class="stat"><dt>{charts.esc(label)}</dt><dd>{charts.esc(value)}{note_html}</dd></div>'
 
 
-def _summary(runs, builds) -> str:
+def _budget_toggle(runs: int) -> str:
+    """The switch between the two pre-rendered CI views.
+
+    Only rendered when there is something to exclude. Both views are already
+    in the page and the switch just shows one, so the file stays static.
+    """
+    return (
+        '<label class="toggle"><input type="checkbox" id="budget-x"> '
+        "<span>Exclude runs blocked by the Actions budget"
+        f"<small>{runs:,} run{'' if runs == 1 else 's'} failed without starting because a GitHub Actions "
+        "budget or spending limit had been reached — nothing was built, so they say nothing about "
+        f"the code. Only the last {JOB_WINDOW_DAYS} days of jobs are read, so older ones can't be "
+        "told apart and stay in.</small></span></label>"
+    )
+
+
+def _summary(runs, builds, stored: int | None = None) -> str:
     recent = [r for r in runs if r["exec_ms"] is not None][-200:]
     concluded = [r for r in runs if r["conclusion"] is not None][-200:]
     failures = sum(1 for r in concluded if r["conclusion"] == "failure")
@@ -415,7 +436,7 @@ def _summary(runs, builds) -> str:
     hit_rate = 100.0 * sum(1 for b in hits if b["config_cache"] == "hit") / len(hits) if hits else None
 
     cells = [
-        _stat("CI runs stored", f"{len(runs):,}"),
+        _stat("CI runs stored", f"{len(runs) if stored is None else stored:,}"),
         _stat("Median CI run", ms(percentile([r["exec_ms"] for r in recent], 0.5)) if recent else "—", "last 200"),
         _stat("CI failure rate", pct(100.0 * failures / len(concluded)) if concluded else "—", "last 200"),
         _stat("Local builds stored", f"{len(builds):,}"),
@@ -446,6 +467,11 @@ h3{font-size:15px;margin:0}
 .stat dt{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 .stat dd{margin:2px 0 0;font-size:21px;font-variant-numeric:tabular-nums}
 .stat small{display:block;font-size:11px;color:var(--muted);font-weight:400}
+.toggle{display:flex;gap:9px;align-items:flex-start;margin:16px 0 0;cursor:pointer}
+.toggle input{margin:4px 0 0;accent-color:var(--s0)}
+.toggle small{display:block;color:var(--muted);font-size:12px;max-width:80ch}
+.view-x,body.no-budget .view-all{display:none}
+body.no-budget .view-x{display:block}
 .chart{margin:20px 0;padding:14px 16px 6px;background:var(--card);
   border:1px solid var(--line);border-radius:8px;overflow-x:auto}
 figcaption p{margin:2px 0 0;color:var(--muted);font-size:13px;max-width:72ch}
@@ -617,6 +643,24 @@ _TOOLTIP_JS = """
 """
 
 
+_BUDGET_JS = """
+(function () {
+  var box = document.getElementById('budget-x');
+  if (!box) return;
+  var KEY = 'buildloop:exclude-budget';
+  function apply() { document.body.classList.toggle('no-budget', box.checked); }
+  // Storage can be unavailable (private window, file:// in some browsers);
+  // the switch still works, it just isn't remembered.
+  try { box.checked = localStorage.getItem(KEY) === '1'; } catch (e) {}
+  apply();
+  box.addEventListener('change', function () {
+    apply();
+    try { localStorage.setItem(KEY, box.checked ? '1' : '0'); } catch (e) {}
+  });
+})();
+"""
+
+
 _ASK_JS = """
 (function () {
   var cfg = window.BUILDLOOP_ASK;
@@ -702,35 +746,52 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
     local_weeks = _axis([week_start(b["ts"]) for b in builds])
     workflows = _top_workflows(runs)
 
-    ci_charts = [
-        ci_duration_chart("c1", runs, ci_weeks, workflows),
-        ci_p90_chart("c2", runs, ci_weeks, workflows),
-        ci_queue_vs_exec_chart("c3", runs, ci_weeks),
-        ci_failure_rate_chart("c4", runs, ci_weeks, workflows),
-        ci_flaky_jobs_chart("c5", conn, project),
-        ci_slow_steps_chart("c6", conn, project),
-    ]
-    local_charts = [
-        local_duration_chart("c7", builds, local_weeks),
-        local_task_set_chart("c8", builds),
-        local_cache_chart("c9", builds, local_weeks),
-        local_config_cache_chart("c10", builds, local_weeks),
-    ]
-    # The reasons table sits right under "Failures by job": the chart says
-    # which job, the table says what went wrong in it.
-    ci_section = (
-        "".join(c.html for c in ci_charts[:5])
-        + ci_failure_reasons(conn, project, repo)
-        + "".join(c.html for c in ci_charts[5:])
-    )
-    local_section = "".join(c.html for c in local_charts)
+    def ci_view(suffix: str, view_runs, exclude_budget: bool) -> tuple[dict[str, Chart], str]:
+        """The CI charts the budget switch changes, plus the reasons table.
 
-    ids = [f"c{i}" for i in range(1, len(ci_charts) + len(local_charts) + 1)]
-    registry = {
-        cid: c.meta
-        for cid, c in zip(ids, ci_charts + local_charts)
-        if c.meta is not None
-    }
+        The table sits right under "Failures by job": the chart says which
+        job, the table says what went wrong in it.
+        """
+        view = {
+            f"c1{suffix}": ci_duration_chart(f"c1{suffix}", view_runs, ci_weeks, workflows),
+            f"c2{suffix}": ci_p90_chart(f"c2{suffix}", view_runs, ci_weeks, workflows),
+            f"c3{suffix}": ci_queue_vs_exec_chart(f"c3{suffix}", view_runs, ci_weeks),
+            f"c4{suffix}": ci_failure_rate_chart(f"c4{suffix}", view_runs, ci_weeks, workflows),
+            f"c5{suffix}": ci_flaky_jobs_chart(f"c5{suffix}", conn, project, exclude_budget),
+        }
+        html = "".join(c.html for c in view.values()) + ci_failure_reasons(
+            conn, project, repo, exclude_budget, f"failures{suffix}")
+        return view, html
+
+    all_charts, ci_section = ci_view("", runs, False)
+    summary = _summary(runs, builds)
+    toggle = ""
+
+    # A run GitHub refused to start is a failure in the API and a ~3 second
+    # "build" in the timings. The second view is the same page without them:
+    # same weeks, same workflows and colours, so the two compare directly.
+    blocked = db.budget_blocked_runs(conn, project)
+    if blocked:
+        kept = [r for r in runs if r["run_id"] not in blocked]
+        x_charts, x_section = ci_view("x", kept, True)
+        all_charts.update(x_charts)
+        ci_section = (f'<div class="view-all">{ci_section}</div>'
+                      f'<div class="view-x">{x_section}</div>')
+        summary = (f'<div class="view-all">{summary}</div>'
+                   f'<div class="view-x">{_summary(kept, builds, stored=len(runs))}</div>')
+        toggle = _budget_toggle(len(runs) - len(kept))
+
+    all_charts["c6"] = ci_slow_steps_chart("c6", conn, project)
+    ci_section += all_charts["c6"].html
+    all_charts.update({
+        "c7": local_duration_chart("c7", builds, local_weeks),
+        "c8": local_task_set_chart("c8", builds),
+        "c9": local_cache_chart("c9", builds, local_weeks),
+        "c10": local_config_cache_chart("c10", builds, local_weeks),
+    })
+    local_section = "".join(all_charts[f"c{i}"].html for i in range(7, 11))
+
+    registry = {cid: c.meta for cid, c in all_charts.items() if c.meta is not None}
     # </ ends a script element wherever it appears inside one, including inside
     # a string literal, so it has to be broken up.
     blob = json.dumps(registry, separators=(",", ":")).replace("</", "<\\/")
@@ -748,7 +809,8 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
 <body><main>
 <h1>{charts.esc(project)}</h1>
 <p class="sub">Is the development loop getting faster or slower, and is CI getting flakier?</p>
-{_summary(runs, builds)}
+{toggle}
+{summary}
 {_analysis(analysis)}
 {_ask_panel(ask)}
 
@@ -767,6 +829,7 @@ produces a comparison that looks meaningful and is not.</p>
 <div id="tip" role="tooltip"></div>
 <script>window.BUILDLOOP={blob};</script>
 <script>{_TOOLTIP_JS}</script>
+<script>{_BUDGET_JS}</script>
 <script>window.BUILDLOOP_ASK={ask_cfg};</script>
 <script>{_ASK_JS}</script>
 </body></html>
