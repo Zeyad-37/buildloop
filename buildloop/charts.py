@@ -15,12 +15,14 @@ and the browser only positions strings.
 from __future__ import annotations
 
 import html
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 W, H = 900, 260
 PAD_L, PAD_R, PAD_T, PAD_B = 62, 16, 14, 46
 
 SERIES_COLORS = 6  # matches --s0..--s5 in the stylesheet
+TICK_CHAR_W = 6.5  # rough advance of one 11px tick character, for fitting labels
 
 
 @dataclass
@@ -56,13 +58,23 @@ def _nice_max(value: float) -> float:
 
 
 def _x_labels(categories: list[str], limit: int = 10) -> list[tuple[int, str]]:
+    """At most ``limit`` labels, always including the latest category.
+
+    The latest replaces the regular label before it rather than joining it:
+    appended, it can land a single slot from its neighbour and overprint it.
+    """
     if not categories:
         return []
-    step = max(1, len(categories) // limit)
-    return [(i, c) for i, c in enumerate(categories) if i % step == 0 or i == len(categories) - 1]
+    last = len(categories) - 1
+    step = max(1, -(-len(categories) // limit))
+    shown = list(range(0, len(categories), step))
+    shown[-1] = last
+    return [(i, categories[i]) for i in shown]
 
 
-def _axes(categories, y_max, y_fmt, *, x_slot_center: bool) -> list[str]:
+def _axes(categories, y_max, y_fmt, *, x_slot_center: bool,
+          axis_fmt: Callable[[float], str] | None = None) -> list[str]:
+    axis_fmt = axis_fmt or y_fmt
     n = max(len(categories), 1)
     plot_w = W - PAD_L - PAD_R
     plot_h = H - PAD_T - PAD_B
@@ -72,13 +84,18 @@ def _axes(categories, y_max, y_fmt, *, x_slot_center: bool) -> list[str]:
         value = y_max * (1 - i / 4)
         out.append(f'<line class="grid" x1="{PAD_L}" y1="{y:.1f}" x2="{W - PAD_R}" y2="{y:.1f}"/>')
         out.append(
-            f'<text class="tick" x="{PAD_L - 8}" y="{y + 4:.1f}" text-anchor="end">{esc(y_fmt(value))}</text>'
+            f'<text class="tick" x="{PAD_L - 8}" y="{y + 4:.1f}" text-anchor="end">{esc(axis_fmt(value))}</text>'
         )
     slot = plot_w / n
     for i, label in _x_labels(categories):
         x = PAD_L + (slot * (i + 0.5) if x_slot_center else (plot_w * i / max(n - 1, 1)))
+        anchor = "middle"
+        # Centred on the last category, a date overruns the viewBox and is
+        # clipped mid-digit; right-align it to the edge instead.
+        if x + len(label) * TICK_CHAR_W / 2 > W:
+            x, anchor = W - 2, "end"
         out.append(
-            f'<text class="tick" x="{x:.1f}" y="{H - PAD_B + 18}" text-anchor="middle">{esc(label)}</text>'
+            f'<text class="tick" x="{x:.1f}" y="{H - PAD_B + 18}" text-anchor="{anchor}">{esc(label)}</text>'
         )
     return out
 
@@ -166,8 +183,13 @@ def line_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str
     return Chart(_frame(cid, title, subtitle, "".join(parts), _legend([s.label for s in series])), meta)
 
 
-def stacked_bar_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str) -> Chart:
-    """Stacked bars — for compositions that must be read as a whole."""
+def stacked_bar_chart(cid, title, subtitle, categories, series: list[Series], y_fmt=str,
+                      axis_fmt: Callable[[float], str] | None = None) -> Chart:
+    """Stacked bars — for compositions that must be read as a whole.
+
+    ``axis_fmt``, if given, labels the y axis instead of ``y_fmt``, for values
+    whose exact form is too wide for the axis gutter.
+    """
     lookup = [{c: v for c, v in s.points} for s in series]
     totals = [sum(t.get(cat) or 0 for t in lookup) for cat in categories]
     if not any(totals):
@@ -177,7 +199,7 @@ def stacked_bar_chart(cid, title, subtitle, categories, series: list[Series], y_
     slot = plot_w / max(len(categories), 1)
     bar_w = max(slot * 0.7, 1.0)
 
-    parts = _axes(categories, y_max, y_fmt, x_slot_center=True)
+    parts = _axes(categories, y_max, y_fmt, x_slot_center=True, axis_fmt=axis_fmt)
     for ci, cat in enumerate(categories):
         base = 0.0
         x = PAD_L + slot * ci + (slot - bar_w) / 2

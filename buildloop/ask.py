@@ -14,9 +14,9 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
-from . import claude_cli, insights
-from .dashboard import percentile, week_start
-from .humanize import ms
+from . import claude_cli, insights, minutes
+from .dashboard import percentile, week_start, weekly_jobs
+from .humanize import mins, ms
 
 MAX_QUESTION_CHARS = 500
 MAX_HISTORY_TURNS = 6
@@ -54,6 +54,20 @@ def _weekly_ci(runs, weeks: set[str], workflows: list[str]) -> dict:
                 "failure_rate_pct": round(100.0 * failed / len(concluded), 1) if concluded else None,
             })
         out[wf] = rows
+    return out
+
+
+def _weekly_minutes(conn: sqlite3.Connection, project: str, cutoff: str) -> list[dict]:
+    """Runner minutes per week, on exactly the chart's weeks (``weekly_jobs``):
+    gap weeks are present as zero, and the earliest, partial week is dropped."""
+    out = []
+    for wk, rows in weekly_jobs(minutes.jobs(conn, project, cutoff)):
+        t = minutes.totals(rows)
+        out.append({
+            "week_of": wk,
+            "total": mins(t["total"]),
+            "by_runner_os": {k: mins(v) for k, v in t["by_os"].items()},
+        })
     return out
 
 
@@ -112,6 +126,7 @@ def build_context(conn: sqlite3.Connection, project: str) -> dict:
         workflows = list((context.get("ci") or {}).get("workflows", {}).keys())
         context["ci_weekly_last_26_weeks"] = _weekly_ci(runs, weeks, workflows)
         context["ci_job_failure_trends"] = _job_trends(conn, project)
+        context["ci_minutes_weekly"] = _weekly_minutes(conn, project, cutoff)
 
     builds = conn.execute(
         "SELECT ts, tasks, duration_ms, measured_from, exec_ms, outcome, config_cache, "

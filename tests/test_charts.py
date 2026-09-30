@@ -53,5 +53,46 @@ class TestTooltipMetadata(unittest.TestCase):
         self.assertNotIn("<script>x", c.html)
 
 
+class TestXLabels(unittest.TestCase):
+    def test_never_more_than_the_limit(self):
+        for n in range(1, 60):
+            self.assertLessEqual(len(charts._x_labels([str(i) for i in range(n)])), 10, n)
+
+    def test_latest_is_always_labelled(self):
+        for n in range(1, 60):
+            self.assertEqual(charts._x_labels([str(i) for i in range(n)])[-1][0], n - 1, n)
+
+    def test_labels_stay_at_least_a_step_apart(self):
+        # 17 weeks used to label every one; 18 put the latest one slot from its
+        # neighbour. Either way the dates overprinted.
+        for n in (17, 18, 21, 44):
+            idx = [i for i, _ in charts._x_labels([str(i) for i in range(n)])]
+            step = -(-n // 10)
+            self.assertTrue(all(b - a >= step for a, b in zip(idx, idx[1:])), (n, idx))
+
+
+class TestAxisRendering(unittest.TestCase):
+    CATS = [f"2026-{m:02d}-{d:02d}" for m in (1, 2, 3) for d in range(1, 11)]  # 30 weeks
+
+    def chart(self, **kw):
+        return charts.stacked_bar_chart(
+            "c", "t", "s", self.CATS, [Series("a", [(c, 1000 * (i + 1)) for i, c in enumerate(self.CATS)])],
+            ms, **kw,
+        )
+
+    def test_last_x_label_is_right_aligned_to_the_edge(self):
+        # Centred on the last of 30 slots, a date overruns the viewBox and is clipped.
+        html = self.chart().html
+        y = charts.H - charts.PAD_B + 18
+        self.assertIn(f'x="{charts.W - 2:.1f}" y="{y}" text-anchor="end">{self.CATS[-1]}</text>', html)
+        self.assertRegex(html, rf'y="{y}" text-anchor="middle">{self.CATS[0]}</text>')
+
+    def test_axis_fmt_labels_the_y_axis_only(self):
+        c = self.chart(axis_fmt=lambda v: f"AX{v:.0f}")
+        self.assertIn('text-anchor="end">AX', c.html)
+        self.assertEqual(c.meta["totals"][0], "1s")
+        self.assertNotIn("AX", "".join(c.meta["totals"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,9 +25,9 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from . import claude_cli, db
+from . import claude_cli, db, minutes
 from .ci_collector import JOB_WINDOW_DAYS
-from .humanize import ms
+from .humanize import mins, ms
 
 STATE_PREFIX = "insight:"
 DEFAULT_TIMEOUT = claude_cli.DEFAULT_TIMEOUT
@@ -83,6 +83,7 @@ def summarize(conn: sqlite3.Connection, project: str) -> dict:
         summary["ci"]["flaky_jobs"] = _flaky_jobs(conn, project)
         summary["ci"]["slow_steps"] = _slow_steps(conn, project)
         summary["ci"]["failure_reasons"] = _failure_reasons(conn, project)
+        summary["ci"]["minutes"] = _minutes(conn, project, recent, prior)
 
     builds = conn.execute(
         "SELECT ts, tasks, duration_ms, measured_from, outcome, config_cache, "
@@ -170,6 +171,30 @@ def _failure_reasons(conn: sqlite3.Connection, project: str) -> dict:
         ],
         "knock_on_failures_excluded": data["knock_on"],
     }
+
+
+def _minutes(conn: sqlite3.Connection, project: str, recent: str, prior: str) -> dict | None:
+    """Runner minutes, recent window against the one before.
+
+    None when no job detail has been collected, so the model says nothing
+    about minutes rather than reporting zero.
+    """
+    jobs = minutes.jobs(conn, project, prior)
+    if not jobs:
+        return None
+    out: dict = {
+        "measure": "runner minutes: each job's duration rounded up to the whole minute, "
+                   "summed across parallel jobs; not weighted by the OS billing rate",
+    }
+    for label, rows in (("recent", [j for j in jobs if j["started_at"] >= recent]),
+                        ("previous", [j for j in jobs if j["started_at"] < recent])):
+        t = minutes.totals(rows)
+        out[label] = {
+            "total": mins(t["total"]),
+            "by_runner_os": {k: mins(v) for k, v in t["by_os"].items()},
+            "top_workflows": {k: mins(v) for k, v in list(t["by_workflow"].items())[:5]},
+        }
+    return out
 
 
 def _slow_steps(conn, project) -> list[dict]:
