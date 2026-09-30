@@ -382,15 +382,15 @@ class TestBudget(DbCase):
         self.assertIn("50%", everything)
         self.assertNotIn("50%", excluded.split("</dl>")[0])
         self.assertIn("0%", excluded.split("</dl>")[0])
-        for cid in ("c4", "c4x", "failures", "failuresx"):
+        for cid in ("c5", "c5x", "failures", "failuresx"):
             self.assertEqual(page.count(f'id="{cid}"'), 1)
 
     def test_excluded_view_drops_blocked_jobs_from_failures_by_job(self):
         self.add_blocked(1, 1, "build", 60, 59)
         self.add_job(2, 2, "build", 40, 30)
         self.add_failure(2, "Detekt found new issues")
-        self.assertIn("(2/2)", dashboard.ci_flaky_jobs_chart("c5", self.conn, "p").html)
-        self.assertIn("(1/1)", dashboard.ci_flaky_jobs_chart("c5", self.conn, "p", True).html)
+        self.assertIn("(2/2)", dashboard.ci_flaky_jobs_chart("c6", self.conn, "p").html)
+        self.assertIn("(1/1)", dashboard.ci_flaky_jobs_chart("c6", self.conn, "p", True).html)
         table = dashboard.ci_failure_reasons(self.conn, "p", exclude_budget=True)
         self.assertNotIn("not started", table)
         self.assertIn("1 jobs an Actions budget kept from starting left out", table)

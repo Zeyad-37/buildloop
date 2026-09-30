@@ -14,14 +14,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 
-from . import charts, db
+from . import charts, db, minutes
 from .charts import Chart, Series
-from .humanize import count, ms, pct
+from .humanize import count, mins, mins_axis, ms, pct
 
 JOB_WINDOW_DAYS = 90
 TOP_N = 12
+MINUTES_STAT_DAYS = 28
 
 
 # --- aggregation helpers ----------------------------------------------------
@@ -60,6 +62,26 @@ def _weeks_between(first: str, last: str) -> list[str]:
 def _axis(rows_weeks: list[str]) -> list[str]:
     weeks = [w for w in rows_weeks if w]
     return _weeks_between(min(weeks), max(weeks)) if weeks else []
+
+
+def weekly_jobs(jobs: Iterable[sqlite3.Row]) -> list[tuple[str, list[sqlite3.Row]]]:
+    """Jobs grouped by week, for the minutes chart and the question box alike.
+
+    Every week in range is present, empty ones included: a week with no jobs
+    is information, and leaving it out lets "which week used the fewest
+    minutes?" be answered wrongly. The earliest week is dropped when there is
+    more than one — it is cut mid-week by the job window or the cutoff, and a
+    sum over a partial week reads as a quiet week, which it wasn't.
+    """
+    buckets: dict[str, list[sqlite3.Row]] = {}
+    for j in jobs:
+        wk = week_start(j["started_at"])
+        if wk:
+            buckets.setdefault(wk, []).append(j)
+    weeks = _axis(list(buckets))
+    if len(weeks) > 1:
+        weeks = weeks[1:]
+    return [(w, buckets.get(w, [])) for w in weeks]
 
 
 def _top_workflows(runs: list[sqlite3.Row], limit: int = 5) -> list[str]:
@@ -126,6 +148,33 @@ def ci_queue_vs_exec_chart(cid, runs, weeks) -> Chart:
             Series("executing", [(w, percentile(v, 0.5)) for w, v in sorted(execu.items())]),
         ],
         ms,
+    )
+
+
+def ci_minutes_chart(cid: str, jobs: Iterable[sqlite3.Row]) -> Chart:
+    """Runner minutes per week, stacked by runner OS.
+
+    Its own axis, not the run history's: minutes come from job detail, which
+    only goes back as far as the first refresh's job window. See
+    ``weekly_jobs`` for why the first week is dropped.
+    """
+    weekly = [(w, minutes.totals(rows)["by_os"]) for w, rows in weekly_jobs(jobs)]
+    weeks = [w for w, _ in weekly]
+    # Only over the weeks kept: an OS used only in the dropped first week
+    # would otherwise get a legend key with no bars.
+    present = [o for o in minutes.OS_ORDER if any(o in by_os for _, by_os in weekly)]
+    subtitle = (
+        "Runner minutes per week, by runner OS: every job's duration, each rounded up to the whole "
+        "minute as GitHub bills it. Parallel jobs add up, so this outgrows run duration. macOS and "
+        "Windows minutes are billed at a higher rate than Linux."
+    )
+    # The axis ends at the latest week with jobs, which is not necessarily this one.
+    if weeks and weeks[-1] == week_start(datetime.now(timezone.utc).isoformat()):
+        subtitle += " This week is still running."
+    return charts.stacked_bar_chart(
+        cid, "CI minutes", subtitle, weeks,
+        [Series(o, [(w, by_os.get(o)) for w, by_os in weekly]) for o in present],
+        mins, axis_fmt=mins_axis,
     )
 
 
@@ -428,17 +477,20 @@ def _budget_toggle(runs: int) -> str:
     )
 
 
-def _summary(runs, builds, stored: int | None = None) -> str:
+def _summary(runs, builds, jobs, stored: int | None = None) -> str:
     recent = [r for r in runs if r["exec_ms"] is not None][-200:]
     concluded = [r for r in runs if r["conclusion"] is not None][-200:]
     failures = sum(1 for r in concluded if r["conclusion"] == "failure")
     hits = [b for b in builds if b["config_cache"] in ("hit", "miss")]
     hit_rate = 100.0 * sum(1 for b in hits if b["config_cache"] == "hit") / len(hits) if hits else None
+    since = (datetime.now(timezone.utc) - timedelta(days=MINUTES_STAT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    used = minutes.totals([j for j in jobs if j["started_at"] >= since])["total"] if jobs else None
 
     cells = [
         _stat("CI runs stored", f"{len(runs) if stored is None else stored:,}"),
         _stat("Median CI run", ms(percentile([r["exec_ms"] for r in recent], 0.5)) if recent else "—", "last 200"),
         _stat("CI failure rate", pct(100.0 * failures / len(concluded)) if concluded else "—", "last 200"),
+        _stat("CI minutes", mins(used), f"last {MINUTES_STAT_DAYS} days"),
         _stat("Local builds stored", f"{len(builds):,}"),
         _stat("Config-cache hits", pct(hit_rate) if hit_rate is not None else "—", "all time"),
     ]
@@ -741,6 +793,7 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
     builds = conn.execute(
         "SELECT * FROM gradle_build WHERE project = ? ORDER BY ts", (project,)
     ).fetchall()
+    jobs = minutes.jobs(conn, project)
 
     ci_weeks = _axis([week_start(r["created_at"]) for r in runs])
     local_weeks = _axis([week_start(b["ts"]) for b in builds])
@@ -750,21 +803,24 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
         """The CI charts the budget switch changes, plus the reasons table.
 
         The table sits right under "Failures by job": the chart says which
-        job, the table says what went wrong in it.
+        job, the table says what went wrong in it. CI minutes are the same in
+        both views — a job that never started is still in ``ci_job`` — and are
+        only repeated to keep their place in the order.
         """
         view = {
             f"c1{suffix}": ci_duration_chart(f"c1{suffix}", view_runs, ci_weeks, workflows),
             f"c2{suffix}": ci_p90_chart(f"c2{suffix}", view_runs, ci_weeks, workflows),
             f"c3{suffix}": ci_queue_vs_exec_chart(f"c3{suffix}", view_runs, ci_weeks),
-            f"c4{suffix}": ci_failure_rate_chart(f"c4{suffix}", view_runs, ci_weeks, workflows),
-            f"c5{suffix}": ci_flaky_jobs_chart(f"c5{suffix}", conn, project, exclude_budget),
+            f"c4{suffix}": ci_minutes_chart(f"c4{suffix}", jobs),
+            f"c5{suffix}": ci_failure_rate_chart(f"c5{suffix}", view_runs, ci_weeks, workflows),
+            f"c6{suffix}": ci_flaky_jobs_chart(f"c6{suffix}", conn, project, exclude_budget),
         }
         html = "".join(c.html for c in view.values()) + ci_failure_reasons(
             conn, project, repo, exclude_budget, f"failures{suffix}")
         return view, html
 
     all_charts, ci_section = ci_view("", runs, False)
-    summary = _summary(runs, builds)
+    summary = _summary(runs, builds, jobs)
     toggle = ""
 
     # A run GitHub refused to start is a failure in the API and a ~3 second
@@ -778,18 +834,18 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
         ci_section = (f'<div class="view-all">{ci_section}</div>'
                       f'<div class="view-x">{x_section}</div>')
         summary = (f'<div class="view-all">{summary}</div>'
-                   f'<div class="view-x">{_summary(kept, builds, stored=len(runs))}</div>')
+                   f'<div class="view-x">{_summary(kept, builds, jobs, stored=len(runs))}</div>')
         toggle = _budget_toggle(len(runs) - len(kept))
 
-    all_charts["c6"] = ci_slow_steps_chart("c6", conn, project)
-    ci_section += all_charts["c6"].html
+    all_charts["c7"] = ci_slow_steps_chart("c7", conn, project)
+    ci_section += all_charts["c7"].html
     all_charts.update({
-        "c7": local_duration_chart("c7", builds, local_weeks),
-        "c8": local_task_set_chart("c8", builds),
-        "c9": local_cache_chart("c9", builds, local_weeks),
-        "c10": local_config_cache_chart("c10", builds, local_weeks),
+        "c8": local_duration_chart("c8", builds, local_weeks),
+        "c9": local_task_set_chart("c9", builds),
+        "c10": local_cache_chart("c10", builds, local_weeks),
+        "c11": local_config_cache_chart("c11", builds, local_weeks),
     })
-    local_section = "".join(all_charts[f"c{i}"].html for i in range(7, 11))
+    local_section = "".join(all_charts[f"c{i}"].html for i in range(8, 12))
 
     registry = {cid: c.meta for cid, c in all_charts.items() if c.meta is not None}
     # </ ends a script element wherever it appears inside one, including inside

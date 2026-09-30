@@ -108,6 +108,7 @@ that looks meaningful and is not.
 | Run duration (median) per workflow | Is CI getting slower? |
 | Run duration (p90) per workflow | Is it getting less predictable? |
 | Queue time vs execution time | Is it us, or is it GitHub? |
+| CI minutes per week, by runner OS | How much runner time is CI using? |
 | Failure rate per week | Is CI getting flakier? |
 | Failures by job (90d) | *Which* job is the flaky one? |
 | Why CI fails (90d) | *What* went wrong — the error from each failed job's log, grouped |
@@ -116,7 +117,7 @@ that looks meaningful and is not.
 When GitHub refuses to start a job because an Actions budget or spending limit
 was reached, the run is recorded as a failure that took three seconds. If a
 project has any, a switch at the top of the page — **Exclude runs blocked by the
-Actions budget** — shows every CI figure without them. They are recognised from
+Actions budget** — shows the CI figures without them (CI minutes aside). They are recognised from
 the job's annotation, so only within the 90 days jobs are read for; the first
 refresh after upgrading re-reads the affected jobs once.
 
@@ -128,6 +129,17 @@ refresh after upgrading re-reads the affected jobs once.
 | Slowest task sets | Which invocations cost me the day? |
 | Cache effectiveness | Is the build cache still earning its keep? |
 | Configuration-cache hit rate | Am I silently losing the config cache? |
+
+CI minutes are not run duration. A run's duration is wall-clock time; its
+minutes are the sum of its jobs' durations, each rounded up to the whole minute
+as GitHub bills them, so five parallel ten-minute jobs take ten minutes and use
+fifty. They are split by runner OS rather than priced, because macOS and Windows
+minutes bill at a higher rate than Linux and the price list is GitHub's, not
+buildloop's. Minutes come from job detail, so they start where the first
+refresh's 90-day job window did. Re-runs are counted as refreshes saw them: a
+run first collected after its re-run counts only the latest attempt, one
+re-synced while its re-run was going keeps every attempt it saw, and one
+re-run between refreshes counts only its first attempt.
 
 The local charts start empty — there is no way to recover builds that already
 happened, so give it a couple of weeks before the local half is interesting.
