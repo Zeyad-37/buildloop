@@ -15,11 +15,13 @@ Computed from ``ci_job``, so it covers the rolling job window plus whatever has
 accumulated since the first refresh — not the full run history. Re-runs are
 counted as refreshes observed them. Jobs are fetched per run with
 ``filter=latest`` and stored by ``job_id``, a re-run attempt gets new job IDs,
-and a run is only re-fetched while it is unsynced or not yet completed. So a
-run first collected after its re-run counts only its latest attempt; one
-collected before the re-run and re-synced while it was running keeps every
-attempt it saw; one whose re-run finished between refreshes counts only its
-first attempt.
+and a run is fetched again until it has completed and whenever its attempt
+number moves. So a run first collected after its re-run counts only its latest
+attempt; one collected before the re-run keeps every attempt a refresh saw,
+including a re-run that started and finished between two refreshes. An attempt
+that was itself superseded before any refresh is not counted, and nor is a
+re-run of a run created more than a day before the last refresh's newest run,
+which the runs listing no longer returns (see ``ci_collector._collect_jobs``).
 """
 
 from __future__ import annotations

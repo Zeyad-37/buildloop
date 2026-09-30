@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -128,6 +128,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {r[1] for r in conn.execute("PRAGMA table_info(ci_job)")}
     if "run_attempt" not in columns:
         conn.execute("ALTER TABLE ci_job ADD COLUMN run_attempt INTEGER")
+    # v3: jobs_synced now means "final", not "fetched". Before, a run caught
+    # mid-flight was marked on its first fetch and never read again, leaving
+    # jobs with no conclusion or duration. Release those, and anything still
+    # running, to be fetched once more. A run whose late jobs did not exist
+    # yet at that fetch, and whose stored jobs all happened to be finished,
+    # leaves no trace to find it by and stays as it is.
+    if version < 3:
+        conn.execute(
+            """
+            UPDATE ci_run SET jobs_synced = 0
+            WHERE jobs_synced = 1
+              AND (status IS NOT 'completed'
+                   OR run_id IN (SELECT run_id FROM ci_job WHERE conclusion IS NULL))
+            """
+        )
     # Future migrations append here, guarded on `version`.
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -179,7 +194,11 @@ def upsert_run(conn: sqlite3.Connection, row: dict) -> None:
             started_at = excluded.started_at,
             updated_at = excluded.updated_at,
             queue_ms   = excluded.queue_ms,
-            exec_ms    = excluded.exec_ms
+            exec_ms    = excluded.exec_ms,
+            -- A re-run is a new attempt with new jobs; the ones already
+            -- fetched belong to the attempt before it.
+            jobs_synced = CASE WHEN excluded.attempt = ci_run.attempt
+                               THEN ci_run.jobs_synced ELSE 0 END
         """,
         row,
     )
