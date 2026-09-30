@@ -288,15 +288,42 @@ def collect(conn: sqlite3.Connection, project: Project, *, log=print,
 
 
 def _collect_jobs(conn, project: Project, stats: CollectStats, log, window_days: int) -> None:
+    """Fetch jobs and steps for every run whose detail is not yet final.
+
+    ``jobs_synced`` means *final*, not *fetched*. Jobs read while a run is
+    still going are a snapshot — some running with no duration, some not
+    created yet — so they are stored, to show something now, but the run stays
+    pending and is read again on each refresh until it has finished. Marking
+    it on the first fetch would strand that snapshot: by the next refresh the
+    run row says ``completed`` and nothing would say to look again.
+
+    A run that never finishes stops being asked about once it is older than
+    ``STALE_RUN_DAYS``; the run itself is no longer re-checked past that, so
+    its jobs would not change either.
+
+    Re-runs keep the run id and start a new attempt with new job ids.
+    ``filter=latest`` returns only the newest attempt's jobs, and
+    ``db.upsert_run`` un-marks a run whose attempt number has moved, so that
+    attempt is fetched even if it started and finished between two refreshes.
+    Jobs of earlier attempts that were already stored are kept, tagged with
+    their ``run_attempt``: they ran and they cost minutes. What is not
+    recovered:
+
+    * an attempt that was itself superseded before any refresh saw it — its
+      jobs are never listed by ``filter=latest``;
+    * a re-run of a run created more than a day before the watermark — the
+      runs listing filters on ``created``, which a re-run does not change, so
+      the new attempt is never seen at all.
+    """
     cutoff = _iso_days_ago(window_days)
+    abandoned_before = _iso_days_ago(STALE_RUN_DAYS)
     pending = conn.execute(
         """
-        SELECT run_id FROM ci_run
-        WHERE project = ? AND created_at >= ?
-          AND (jobs_synced = 0 OR status IS NOT ?)
+        SELECT run_id, status, created_at FROM ci_run
+        WHERE project = ? AND created_at >= ? AND jobs_synced = 0
         ORDER BY created_at DESC
         """,
-        (project.name, cutoff, TERMINAL_STATUS),
+        (project.name, cutoff),
     ).fetchall()
 
     if not pending:
@@ -305,6 +332,7 @@ def _collect_jobs(conn, project: Project, stats: CollectStats, log, window_days:
 
     for i, row in enumerate(pending, 1):
         run_id = row["run_id"]
+        final = row["status"] == TERMINAL_STATUS or row["created_at"] < abandoned_before
         try:
             for raw_job in _iter_jobs(project.github_repo, run_id, stats):
                 db.upsert_job(conn, map_job(raw_job, project.name))
@@ -312,7 +340,8 @@ def _collect_jobs(conn, project: Project, stats: CollectStats, log, window_days:
                 for step in map_steps(raw_job, project.name):
                     db.upsert_step(conn, step)
                     stats.steps += 1
-            db.mark_jobs_synced(conn, run_id)
+            if final:
+                db.mark_jobs_synced(conn, run_id)
         except gh.GhNotFound:
             db.mark_jobs_synced(conn, run_id)  # logs expired; never ask again
         if i % 100 == 0:
