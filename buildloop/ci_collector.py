@@ -338,7 +338,9 @@ def _iter_jobs(repo: str, run_id: int, stats: CollectStats):
 def _collect_failures(conn, project: Project, stats: CollectStats, log, window_days: int) -> None:
     """Read the log of every failed job not yet diagnosed.
 
-    Two requests per failed job — the job, for its step timings, and the log.
+    Two requests per failed job — the job, for its step timings, and the log
+    — and a third, for its annotations, when the job never started and so has
+    neither. Rows stored before annotations were read get that third look once.
     Only failures cost anything, and each is diagnosed once, so after the
     first refresh this is a handful of requests. The first refresh has every
     failure in the window to read, so fetches run a few at a time; database
@@ -349,11 +351,11 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
         """
         SELECT j.job_id FROM ci_job j
         LEFT JOIN ci_failure f ON f.job_id = j.job_id
-        WHERE j.project = ? AND j.conclusion = 'failure' AND j.started_at >= ?
-          AND f.job_id IS NULL
+        WHERE j.project = ? AND j.conclusion = 'failure'
+          AND ((f.job_id IS NULL AND j.started_at >= ?) OR f.cause = ?)
         ORDER BY j.started_at DESC
         """,
-        (project.name, _iso_days_ago(window_days)),
+        (project.name, _iso_days_ago(window_days), db.UNREAD),
     ).fetchall()]
     if not pending:
         return
@@ -389,9 +391,19 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
             text = gh.api_text(f"repos/{repo}/actions/jobs/{job_id}/logs")
         except gh.GhNotFound:
             text = None  # expired: keep the failing step, never ask again
-        return {"job_id": job_id, "project": project.name,
-                **failures.diagnose(raw_job, text)}  # type: ignore[arg-type]
+        found = failures.diagnose(raw_job, text)  # type: ignore[arg-type]
+        if text is None and not raw_job.get("steps"):  # type: ignore[union-attr]
+            # Never started. The only explanation GitHub gives is an
+            # annotation on the check run, which shares the job's id.
+            annotation_reads.append(job_id)
+            try:
+                notes = gh.api(f"repos/{repo}/check-runs/{job_id}/annotations")
+            except gh.GhNotFound:
+                notes = []
+            found = failures.diagnose_unstarted(notes) or found
+        return {"job_id": job_id, "project": project.name, **found}
 
+    annotation_reads: list[int] = []  # appended to from the worker threads
     skipped = 0
     with ThreadPoolExecutor(max_workers=FAILURE_FETCH_WORKERS) as pool:
         try:
@@ -410,5 +422,6 @@ def _collect_failures(conn, project: Project, stats: CollectStats, log, window_d
             # and the next refresh picks them up. Not worth failing CI over.
             pool.shutdown(cancel_futures=True)
             log(f"  failures: rate-limited after {stats.failures}; the rest resume next refresh")
+    stats.requests += len(annotation_reads)
     if skipped:
         log(f"  failures: {skipped} job(s) could not be read; retried next refresh")

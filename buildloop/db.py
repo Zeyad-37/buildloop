@@ -15,7 +15,14 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: ``ci_failure.cause`` for a job GitHub refused to start because an Actions
+#: budget or spending limit was reached. Nothing was built, so it says nothing
+#: about the code.
+BUDGET = "budget"
+#: A row diagnosed before annotations were read, which may be one of those.
+UNREAD = "unread"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -66,14 +73,16 @@ CREATE INDEX IF NOT EXISTS ix_ci_step_project ON ci_step (project, name);
 
 -- Why a failed job failed, read from its log. One row per failed job once
 -- diagnosed; the row existing is what stops it being fetched again, so a job
--- whose log has expired still gets a row, with a NULL reason.
+-- whose log has expired still gets a row, with a NULL reason. `cause` sets
+-- apart failures that are not about the build at all (see BUDGET).
 CREATE TABLE IF NOT EXISTS ci_failure (
     job_id    INTEGER PRIMARY KEY,
     project   TEXT    NOT NULL,
     step      TEXT,
     reason    TEXT,
     signature TEXT,
-    excerpt   TEXT
+    excerpt   TEXT,
+    cause     TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_ci_failure_project ON ci_failure (project, signature);
 
@@ -128,6 +137,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {r[1] for r in conn.execute("PRAGMA table_info(ci_job)")}
     if "run_attempt" not in columns:
         conn.execute("ALTER TABLE ci_job ADD COLUMN run_attempt INTEGER")
+    # v3: ci_failure.cause. A job that never started has no step and no log,
+    # so until now it was stored as unexplained; those rows are flagged to be
+    # read once more, this time from the job's annotations.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(ci_failure)")}
+    if "cause" not in columns:
+        conn.execute("ALTER TABLE ci_failure ADD COLUMN cause TEXT")
+    if version < 3:
+        conn.execute(
+            "UPDATE ci_failure SET cause = ? WHERE reason IS NULL AND step IS NULL AND cause IS NULL",
+            (UNREAD,),
+        )
     # Future migrations append here, guarded on `version`.
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -223,15 +243,16 @@ def upsert_step(conn: sqlite3.Connection, row: dict) -> None:
 def upsert_failure(conn: sqlite3.Connection, row: dict) -> None:
     conn.execute(
         """
-        INSERT INTO ci_failure (job_id, project, step, reason, signature, excerpt)
-        VALUES (:job_id, :project, :step, :reason, :signature, :excerpt)
+        INSERT INTO ci_failure (job_id, project, step, reason, signature, excerpt, cause)
+        VALUES (:job_id, :project, :step, :reason, :signature, :excerpt, :cause)
         ON CONFLICT(job_id) DO UPDATE SET
             step      = excluded.step,
             reason    = excluded.reason,
             signature = excluded.signature,
-            excerpt   = excluded.excerpt
+            excerpt   = excluded.excerpt,
+            cause     = excluded.cause
         """,
-        row,
+        {"cause": None, **row},
     )
 
 
@@ -254,8 +275,12 @@ def knock_on(r: sqlite3.Row, run: list[sqlite3.Row]) -> bool:
     )
 
 
-def failure_groups(conn: sqlite3.Connection, project: str, since: str) -> dict:
+def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
+                   exclude_budget: bool = False) -> dict:
     """Diagnosed failures since ``since``, grouped by what went wrong.
+
+    ``exclude_budget`` leaves out jobs GitHub never started for want of
+    budget; they are counted under ``budget`` either way.
 
     A job that failed only because an earlier job in the same run failed or
     was cancelled — a required-checks gate, a deploy that `needs:` the build —
@@ -274,7 +299,7 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str) -> dict:
         """
         SELECT j.job_id, j.run_id, j.run_attempt, j.name AS job, j.conclusion,
                j.started_at, j.completed_at,
-               f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt
+               f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt, f.cause
         FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
           AND j.started_at >= ?
@@ -289,12 +314,19 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str) -> dict:
         by_run.setdefault(r["run_id"], []).append(r)
 
     groups: dict[str, dict] = {}
-    out = {"groups": [], "knock_on": 0, "no_log": 0, "pending": 0, "total": len(failed)}
+    out = {"groups": [], "knock_on": 0, "no_log": 0, "pending": 0, "budget": 0,
+           "total": len(failed)}
     for r in failed:  # newest first, so a group's first row is its latest
         if r["diagnosed"] is None:
             out["pending"] += 1
             continue
-        if knock_on(r, by_run[r["run_id"]]):
+        if r["cause"] == BUDGET:
+            # Before the knock-on test: every job of a blocked run is refused
+            # for the same reason, none of them because of another.
+            out["budget"] += 1
+            if exclude_budget:
+                continue
+        elif knock_on(r, by_run[r["run_id"]]):
             out["knock_on"] += 1
             continue
         if not r["signature"]:
@@ -313,6 +345,37 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str) -> dict:
     # counts stay newest first.
     out["groups"] = sorted(groups.values(), key=lambda g: -g["count"])
     return out
+
+
+def budget_blocked_runs(conn: sqlite3.Connection, project: str) -> set[int]:
+    """Runs that failed only because GitHub would not start their jobs.
+
+    A run counts when at least one of its failed jobs was refused for budget
+    and every other failed job is either the same or a knock-on. One failure
+    with a cause of its own — or one not diagnosed yet — keeps the run in:
+    the budget did not decide its outcome, or it isn't known that it did.
+    """
+    unhappy = conn.execute(
+        """
+        SELECT j.job_id, j.run_id, j.run_attempt, j.conclusion, j.started_at,
+               j.completed_at, f.cause
+        FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
+        WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
+        """,
+        (project,),
+    ).fetchall()
+    by_run: dict[int, list[sqlite3.Row]] = {}
+    for r in unhappy:
+        by_run.setdefault(r["run_id"], []).append(r)
+
+    blocked = set()
+    for run_id, jobs in by_run.items():
+        failed = [r for r in jobs if r["conclusion"] == "failure"]
+        if any(r["cause"] == BUDGET for r in failed) and all(
+            r["cause"] == BUDGET or knock_on(r, jobs) for r in failed
+        ):
+            blocked.add(run_id)
+    return blocked
 
 
 def mark_jobs_synced(conn: sqlite3.Connection, run_id: int) -> None:
