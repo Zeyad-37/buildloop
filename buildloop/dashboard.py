@@ -799,19 +799,18 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
     local_weeks = _axis([week_start(b["ts"]) for b in builds])
     workflows = _top_workflows(runs)
 
-    def ci_view(suffix: str, view_runs, exclude_budget: bool) -> tuple[dict[str, Chart], str]:
+    def ci_view(suffix: str, view_runs, view_jobs,
+                exclude_budget: bool) -> tuple[dict[str, Chart], str]:
         """The CI charts the budget switch changes, plus the reasons table.
 
         The table sits right under "Failures by job": the chart says which
-        job, the table says what went wrong in it. CI minutes are the same in
-        both views — a job that never started is still in ``ci_job`` — and are
-        only repeated to keep their place in the order.
+        job, the table says what went wrong in it.
         """
         view = {
             f"c1{suffix}": ci_duration_chart(f"c1{suffix}", view_runs, ci_weeks, workflows),
             f"c2{suffix}": ci_p90_chart(f"c2{suffix}", view_runs, ci_weeks, workflows),
             f"c3{suffix}": ci_queue_vs_exec_chart(f"c3{suffix}", view_runs, ci_weeks),
-            f"c4{suffix}": ci_minutes_chart(f"c4{suffix}", jobs),
+            f"c4{suffix}": ci_minutes_chart(f"c4{suffix}", view_jobs),
             f"c5{suffix}": ci_failure_rate_chart(f"c5{suffix}", view_runs, ci_weeks, workflows),
             f"c6{suffix}": ci_flaky_jobs_chart(f"c6{suffix}", conn, project, exclude_budget),
         }
@@ -819,22 +818,23 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
             conn, project, repo, exclude_budget, f"failures{suffix}")
         return view, html
 
-    all_charts, ci_section = ci_view("", runs, False)
+    all_charts, ci_section = ci_view("", runs, jobs, False)
     summary = _summary(runs, builds, jobs)
     toggle = ""
 
-    # A run GitHub refused to start is a failure in the API and a ~3 second
-    # "build" in the timings. The second view is the same page without them:
+    # A run GitHub refused to start is a failure in the API, a ~3 second
+    # "build" in the timings and a minute per job in CI minutes. The second view is the same page without them:
     # same weeks, same workflows and colours, so the two compare directly.
     blocked = db.budget_blocked_runs(conn, project)
     if blocked:
         kept = [r for r in runs if r["run_id"] not in blocked]
-        x_charts, x_section = ci_view("x", kept, True)
+        kept_jobs = [j for j in jobs if j["cause"] != db.BUDGET]
+        x_charts, x_section = ci_view("x", kept, kept_jobs, True)
         all_charts.update(x_charts)
         ci_section = (f'<div class="view-all">{ci_section}</div>'
                       f'<div class="view-x">{x_section}</div>')
         summary = (f'<div class="view-all">{summary}</div>'
-                   f'<div class="view-x">{_summary(kept, builds, jobs, stored=len(runs))}</div>')
+                   f'<div class="view-x">{_summary(kept, builds, kept_jobs, stored=len(runs))}</div>')
         toggle = _budget_toggle(len(runs) - len(kept))
 
     all_charts["c7"] = ci_slow_steps_chart("c7", conn, project)

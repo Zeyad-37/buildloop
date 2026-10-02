@@ -385,6 +385,22 @@ class TestBudget(DbCase):
         for cid in ("c5", "c5x", "failures", "failuresx"):
             self.assertEqual(page.count(f'id="{cid}"'), 1)
 
+    def test_excluded_view_drops_blocked_jobs_from_ci_minutes(self):
+        self.add_run(1, 60, exec_ms=3_000)
+        self.add_run(2, 50, conclusion="success")
+        for job_id in (1, 2, 3):                       # three refused jobs: a minute each
+            self.add_blocked(job_id, 1, f"job{job_id}", 60, 59)
+        db.upsert_job(self.conn, {
+            "job_id": 4, "run_id": 2, "project": "p", "name": "build", "conclusion": "success",
+            "started_at": ago(50), "completed_at": ago(40), "duration_ms": 600_000,
+            "runner": "ubuntu-latest", "run_attempt": None,
+        })
+        page = dashboard.render(self.conn, "p")
+        everything, excluded = page.split('<div class="view-x">')[:2]
+        tile = '<dt>CI minutes</dt><dd>'
+        self.assertIn(tile + "13 min", everything)
+        self.assertIn(tile + "10 min", excluded)
+
     def test_excluded_view_drops_blocked_jobs_from_failures_by_job(self):
         self.add_blocked(1, 1, "build", 60, 59)
         self.add_job(2, 2, "build", 40, 30)

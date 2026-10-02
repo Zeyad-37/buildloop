@@ -117,7 +117,7 @@ that looks meaningful and is not.
 When GitHub refuses to start a job because an Actions budget or spending limit
 was reached, the run is recorded as a failure that took three seconds. If a
 project has any, a switch at the top of the page — **Exclude runs blocked by the
-Actions budget** — shows the CI figures without them (CI minutes aside). They are recognised from
+Actions budget** — shows every CI figure without them. They are recognised from
 the job's annotation, so only within the 90 days jobs are read for; the first
 refresh after upgrading re-reads the affected jobs once.
 
