@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "tech-agency": {
+      "source": {
+        "source": "github",
+        "repo": "Zeyad-37/tech-agency"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "tech-agency@tech-agency": true
+  }
+}
