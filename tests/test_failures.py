@@ -152,6 +152,38 @@ class TestSignature(unittest.TestCase):
                             failures.signature("Coverage dropped"))
 
 
+BUDGET_MESSAGE = "The job was not started because an Actions budget is preventing further use."
+SPENDING_MESSAGE = ("The job was not started because recent account payments have failed or your "
+                    "spending limit needs to be increased. Please check the 'Billing & plans' "
+                    "section in your settings")
+
+
+def annotation(message, level="failure"):
+    return {"path": ".github", "annotation_level": level, "message": message}
+
+
+class TestUnstarted(unittest.TestCase):
+    def test_both_wordings_of_the_refusal_are_budget(self):
+        for message in (BUDGET_MESSAGE, SPENDING_MESSAGE):
+            d = failures.diagnose_unstarted([annotation("ubuntu-latest will migrate", "notice"),
+                                             annotation(message)])
+            self.assertEqual(d["cause"], "budget")
+            self.assertTrue(d["reason"].startswith("The job was not started because"))
+            self.assertIsNone(d["step"])
+
+    def test_another_reason_for_not_starting_is_kept_but_is_not_budget(self):
+        d = failures.diagnose_unstarted(
+            [annotation("The job was not started because the runner group is disabled.")])
+        self.assertIsNone(d["cause"])
+        self.assertIn("runner group", d["reason"])
+
+    def test_unrelated_or_malformed_annotations_explain_nothing(self):
+        self.assertIsNone(failures.diagnose_unstarted(
+            [annotation("Process completed with exit code 1."),
+             annotation(BUDGET_MESSAGE, "notice"), "junk"]))
+        self.assertIsNone(failures.diagnose_unstarted({"message": "Not Found"}))
+
+
 def ago(minutes):
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -172,10 +204,23 @@ class DbCase(unittest.TestCase):
             "duration_ms": 1, "runner": "ubuntu-latest", "run_attempt": attempt,
         })
 
-    def add_failure(self, job_id, reason, step="Build", excerpt="ctx"):
+    def add_failure(self, job_id, reason, step="Build", excerpt="ctx", cause=None):
         db.upsert_failure(self.conn, {
             "job_id": job_id, "project": "p", "step": step, "reason": reason,
             "signature": failures.signature(reason) if reason else None, "excerpt": excerpt,
+            "cause": cause,
+        })
+
+    def add_blocked(self, job_id, run_id, name, start, end):
+        self.add_job(job_id, run_id, name, start, end)
+        self.add_failure(job_id, BUDGET_MESSAGE, step=None, excerpt=None, cause=db.BUDGET)
+
+    def add_run(self, run_id, minutes_ago, conclusion="failure", exec_ms=600_000):
+        db.upsert_run(self.conn, {
+            "run_id": run_id, "project": "p", "workflow": "CI", "branch": "main",
+            "event": "push", "status": "completed", "conclusion": conclusion, "attempt": 1,
+            "created_at": ago(minutes_ago), "started_at": ago(minutes_ago),
+            "updated_at": ago(minutes_ago), "queue_ms": 0, "exec_ms": exec_ms,
         })
 
 
@@ -287,7 +332,112 @@ class TestFailureGroups(DbCase):
         self.assertIn("Detekt found new issues", page)
 
 
+class TestBudget(DbCase):
+    def groups(self, **kw):
+        return db.failure_groups(self.conn, "p", ago(60 * 24 * 90), **kw)
+
+    def test_blocked_jobs_are_a_group_until_excluded(self):
+        self.add_blocked(1, 1, "changes", 60, 59)
+        self.add_blocked(2, 1, "required-checks", 58, 57)  # after job 1, but no knock-on
+        self.add_job(3, 2, "build", 40, 30)
+        self.add_failure(3, "Detekt found new issues")
+
+        data = self.groups()
+        self.assertEqual((data["budget"], data["knock_on"]), (2, 0))
+        self.assertEqual([(g["reason"], g["count"]) for g in data["groups"]],
+                         [(BUDGET_MESSAGE, 2), ("Detekt found new issues", 1)])
+
+        data = self.groups(exclude_budget=True)
+        self.assertEqual(data["budget"], 2)
+        self.assertEqual([g["reason"] for g in data["groups"]], ["Detekt found new issues"])
+
+    def test_a_run_is_blocked_only_if_nothing_else_failed_it(self):
+        self.add_blocked(1, 1, "build", 60, 59)            # run 1: blocked outright
+        self.add_blocked(2, 2, "build", 60, 59)            # run 2: blocked, then its gate
+        self.add_job(3, 2, "gate", 58, 57)                 #        failed on the build
+        self.add_failure(3, "Required job 'build' concluded with 'failure'")
+        self.add_job(4, 3, "lint", 60, 50)                 # run 3: a real failure alongside
+        self.add_failure(4, "Detekt found new issues")
+        self.add_blocked(5, 3, "deploy", 55, 54)
+        self.add_blocked(6, 4, "build", 60, 59)            # run 4: one job not diagnosed yet
+        self.add_job(7, 4, "lint", 60, 50)
+        self.add_job(8, 5, "build", 60, 50)                # run 5: nothing to do with budget
+        self.add_failure(8, "Detekt found new issues")
+        self.assertEqual(db.budget_blocked_runs(self.conn, "p"), {1, 2})
+
+    def test_page_has_the_switch_and_a_second_view_only_when_something_is_blocked(self):
+        self.add_run(1, 60, exec_ms=3_000)
+        self.add_run(2, 50, conclusion="success")
+        self.add_job(2, 2, "build", 50, 40, conclusion="success")
+        page = dashboard.render(self.conn, "p")
+        self.assertNotIn('id="budget-x"', page)
+        self.assertNotIn('class="view-x"', page)
+
+        self.add_blocked(1, 1, "build", 60, 59)
+        page = dashboard.render(self.conn, "p")
+        self.assertIn('id="budget-x"', page)
+        self.assertIn("1 run failed without starting", page)
+        everything, excluded = page.split('<div class="view-x">')[:2]
+        # The summary is the first pair of views: one failure in two runs, or none in one.
+        self.assertIn("50%", everything)
+        self.assertNotIn("50%", excluded.split("</dl>")[0])
+        self.assertIn("0%", excluded.split("</dl>")[0])
+        for cid in ("c5", "c5x", "failures", "failuresx"):
+            self.assertEqual(page.count(f'id="{cid}"'), 1)
+
+    def test_excluded_view_drops_blocked_jobs_from_ci_minutes(self):
+        self.add_run(1, 60, exec_ms=3_000)
+        self.add_run(2, 50, conclusion="success")
+        for job_id in (1, 2, 3):                       # three refused jobs: a minute each
+            self.add_blocked(job_id, 1, f"job{job_id}", 60, 59)
+        db.upsert_job(self.conn, {
+            "job_id": 4, "run_id": 2, "project": "p", "name": "build", "conclusion": "success",
+            "started_at": ago(50), "completed_at": ago(40), "duration_ms": 600_000,
+            "runner": "ubuntu-latest", "run_attempt": None,
+        })
+        page = dashboard.render(self.conn, "p")
+        everything, excluded = page.split('<div class="view-x">')[:2]
+        tile = '<dt>CI minutes</dt><dd>'
+        self.assertIn(tile + "13 min", everything)
+        self.assertIn(tile + "10 min", excluded)
+
+    def test_excluded_view_drops_blocked_jobs_from_failures_by_job(self):
+        self.add_blocked(1, 1, "build", 60, 59)
+        self.add_job(2, 2, "build", 40, 30)
+        self.add_failure(2, "Detekt found new issues")
+        self.assertIn("(2/2)", dashboard.ci_flaky_jobs_chart("c6", self.conn, "p").html)
+        self.assertIn("(1/1)", dashboard.ci_flaky_jobs_chart("c6", self.conn, "p", True).html)
+        table = dashboard.ci_failure_reasons(self.conn, "p", exclude_budget=True)
+        self.assertNotIn("not started", table)
+        self.assertIn("1 jobs an Actions budget kept from starting left out", table)
+
+
 class TestCollectFailures(DbCase):
+    def test_a_job_that_never_started_is_explained_by_its_annotation(self):
+        self.add_job(1, 1, "build", 60, 59)
+        # Stored as unexplained before annotations were read, and long out of the window.
+        self.add_job(2, 2, "build", 60 * 24 * 200, 60 * 24 * 200 - 1)
+        self.add_failure(2, None, step=None, excerpt=None, cause=db.UNREAD)
+
+        def fake_api(path, params=None):
+            if path.endswith("/annotations"):
+                return [annotation(BUDGET_MESSAGE)]
+            return {"steps": []}
+
+        def no_log(path):
+            raise gh.GhNotFound(path)
+
+        project = ci.Project(name="p", github_repo="o/r", gradle_root=None)
+        original = gh.api, gh.api_text, gh.rate_limit_remaining
+        gh.api, gh.api_text, gh.rate_limit_remaining = fake_api, no_log, lambda: None
+        try:
+            ci._collect_failures(self.conn, project, ci.CollectStats(), lambda _m: None, 90)
+        finally:
+            gh.api, gh.api_text, gh.rate_limit_remaining = original
+        rows = {r["job_id"]: (r["reason"], r["cause"])
+                for r in self.conn.execute("SELECT * FROM ci_failure")}
+        self.assertEqual(rows, {1: (BUDGET_MESSAGE, "budget"), 2: (BUDGET_MESSAGE, "budget")})
+
     def test_each_failed_job_is_read_once_and_expiry_is_remembered(self):
         self.add_job(1, 1, "build", 60, 50)
         self.add_job(2, 2, "build", 40, 30)
@@ -311,9 +461,12 @@ class TestCollectFailures(DbCase):
             stats = ci.CollectStats()
             ci._collect_failures(self.conn, project, stats, lambda _m: None, 90)
             self.assertEqual(stats.failures, 2)
-            self.assertEqual(len(calls), 4)  # job + log, for the two failures only
+            # job + log for the two failures only, and the annotations of the
+            # one with neither steps nor log
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(stats.requests, 5)
             ci._collect_failures(self.conn, project, ci.CollectStats(), lambda _m: None, 90)
-            self.assertEqual(len(calls), 4)  # nothing re-fetched, expired one included
+            self.assertEqual(len(calls), 5)  # nothing re-fetched, expired one included
         finally:
             gh.api, gh.api_text, gh.rate_limit_remaining = original
 
@@ -395,6 +548,26 @@ class TestSchema(unittest.TestCase):
                 self.assertEqual((row["name"], row["run_attempt"]), ("build", None))
             finally:
                 conn.close()
+
+    def test_a_v2_database_flags_unexplained_failures_for_another_look(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.sqlite"
+            old = sqlite3.connect(path)
+            old.executescript(
+                "CREATE TABLE ci_failure (job_id INTEGER PRIMARY KEY, project TEXT NOT NULL, "
+                "step TEXT, reason TEXT, signature TEXT, excerpt TEXT);"
+                "INSERT INTO ci_failure VALUES (1, 'p', NULL, NULL, NULL, NULL);"
+                "INSERT INTO ci_failure VALUES (2, 'p', 'Build', NULL, NULL, NULL);"
+                "INSERT INTO ci_failure VALUES (3, 'p', 'Build', 'Boom', 'boom', 'x');"
+                "PRAGMA user_version = 2;"
+            )
+            old.commit()
+            old.close()
+            for _ in range(2):  # and opening it again changes nothing
+                conn = db.connect(path)
+                causes = dict(conn.execute("SELECT job_id, cause FROM ci_failure"))
+                conn.close()
+                self.assertEqual(causes, {1: db.UNREAD, 2: None, 3: None})
 
     def test_map_job_keeps_the_attempt(self):
         raw = {"id": 5, "run_id": 1, "run_attempt": 2}

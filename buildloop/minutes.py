@@ -65,12 +65,15 @@ def jobs(conn: sqlite3.Connection, project: str, since: str | None = None) -> li
     """Every job that used a runner, oldest first, with its run's workflow.
 
     Skipped jobs never get a runner and have no duration; they cost nothing
-    and are left out here rather than counted as zero-minute jobs.
+    and are left out here rather than counted as zero-minute jobs. ``cause``
+    is the job's ``ci_failure.cause``, so a caller can drop jobs GitHub
+    refused to start.
     """
     return conn.execute(
         """
-        SELECT j.started_at, j.duration_ms, j.runner, r.workflow
+        SELECT j.started_at, j.duration_ms, j.runner, r.workflow, f.cause
         FROM ci_job j JOIN ci_run r ON r.run_id = j.run_id
+        LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.duration_ms > 0 AND j.started_at >= ?
         ORDER BY j.started_at
         """,

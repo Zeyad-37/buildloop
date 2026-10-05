@@ -114,6 +114,13 @@ that looks meaningful and is not.
 | Why CI fails (90d) | *What* went wrong — the error from each failed job's log, grouped |
 | Slowest steps (90d) | *Where* inside that job? |
 
+When GitHub refuses to start a job because an Actions budget or spending limit
+was reached, the run is recorded as a failure that took three seconds. If a
+project has any, a switch at the top of the page — **Exclude runs blocked by the
+Actions budget** — shows every CI figure without them. They are recognised from
+the job's annotation, so only within the 90 days jobs are read for; the first
+refresh after upgrading re-reads the affected jobs once.
+
 **Local Gradle**
 
 | Chart | Answers |

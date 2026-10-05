@@ -44,6 +44,13 @@ _TOOL_ERROR = re.compile(r"^(?:error|fatal|Error|ERROR|FATAL)(?:\[\w+\])?: (.+)$
 # "https://host/o/r.git" follows "/" or a word character, never a space.
 _PATH = re.compile(r"(?:file://|(?<![\w.~/:-]))(?:/[\w.@+-]+){2,}/([\w.@+-]+)")
 
+# What GitHub annotates a job with when it refuses to start it. Two wordings
+# of the same refusal are in circulation: "an Actions budget is preventing
+# further use" and "recent account payments have failed or your spending limit
+# needs to be increased".
+_NOT_STARTED = re.compile(r"^The job was not started because .+", re.S)
+_BUDGET = re.compile(r"\bbudget\b|spending limit|payments? ha(?:ve|s) failed", re.I)
+
 _Lines = list[str]
 _Found = tuple[str, list[str]] | None
 
@@ -260,6 +267,27 @@ def diagnose(job: dict, log: str | None) -> dict:
                 "excerpt": "\n".join(_clip(t) for t in excerpt[:MAX_EXCERPT_LINES]),
             }
     return {"step": step_name, "reason": None, "signature": None, "excerpt": None}
+
+
+def diagnose_unstarted(annotations) -> dict | None:
+    """The same record as :func:`diagnose`, for a job that never started.
+
+    Such a job has no steps and no log, so the annotation on its check run is
+    the only place GitHub says why. ``cause`` is "budget" when the reason was
+    an Actions budget or spending limit — a failure that says nothing about
+    the build. None if the annotations don't explain anything.
+    """
+    for a in annotations if isinstance(annotations, list) else []:
+        if not isinstance(a, dict) or a.get("annotation_level") != "failure":
+            continue
+        message = (a.get("message") or "").strip()
+        if _NOT_STARTED.match(message):
+            reason = _short(message)
+            return {
+                "step": None, "reason": reason, "signature": signature(reason), "excerpt": None,
+                "cause": "budget" if _BUDGET.search(message) else None,
+            }
+    return None
 
 
 # A SHA has both digits and letters; an all-letter word ("defaced") or an
