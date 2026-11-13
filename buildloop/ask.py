@@ -14,7 +14,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
-from . import claude_cli, insights, minutes
+from . import claude_cli, insights, minutes, trends
 from .dashboard import percentile, week_start, weekly_jobs
 from .humanize import mins, ms
 
@@ -127,6 +127,16 @@ def build_context(conn: sqlite3.Connection, project: str) -> dict:
         context["ci_weekly_last_26_weeks"] = _weekly_ci(runs, weeks, workflows)
         context["ci_job_failure_trends"] = _job_trends(conn, project)
         context["ci_minutes_weekly"] = _weekly_minutes(conn, project, cutoff)
+        steps = trends.ci_step_weekly(conn, project)
+        if steps:
+            context["ci_step_weekly_last_26_weeks"] = steps
+
+    task_sets = trends.local_task_set_weekly(conn, project)
+    if task_sets:
+        context["local_task_set_weekly_last_26_weeks"] = task_sets
+    tasks = trends.gradle_task_weekly(conn, project)
+    if tasks:
+        context["local_task_weekly_last_26_weeks"] = tasks
 
     builds = conn.execute(
         "SELECT ts, tasks, duration_ms, measured_from, exec_ms, outcome, config_cache, "

@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: ``ci_failure.cause`` for a job GitHub refused to start because an Actions
 #: budget or spending limit was reached. Nothing was built, so it says nothing
@@ -23,6 +23,12 @@ SCHEMA_VERSION = 3
 BUDGET = "budget"
 #: A row diagnosed before annotations were read, which may be one of those.
 UNREAD = "unread"
+
+#: How long per-task rows are kept. Build rows are kept forever; task rows are
+#: two orders of magnitude more numerous and only feed the 26-week trend.
+GRADLE_TASK_DAYS = 180
+#: Outcomes the init script writes for a task.
+TASK_OUTCOMES = ("executed", "from_cache", "up_to_date", "skipped", "failed")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -105,6 +111,19 @@ CREATE TABLE IF NOT EXISTS gradle_build (
     UNIQUE (project, ts, tasks, duration_ms)
 );
 CREATE INDEX IF NOT EXISTS ix_gradle_project_ts ON gradle_build (project, ts);
+
+-- One row per task of a local build that took at least the init script's
+-- TASK_DETAIL_MIN_MS; faster tasks are only counted on gradle_build. Builds
+-- recorded before v4 have no rows here. Pruned after GRADLE_TASK_DAYS.
+CREATE TABLE IF NOT EXISTS gradle_task (
+    build_id    INTEGER NOT NULL REFERENCES gradle_build (id) ON DELETE CASCADE,
+    project     TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    outcome     TEXT    NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    PRIMARY KEY (build_id, path)
+);
+CREATE INDEX IF NOT EXISTS ix_gradle_task_project_path ON gradle_task (project, path);
 
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
@@ -382,8 +401,8 @@ def mark_jobs_synced(conn: sqlite3.Connection, run_id: int) -> None:
     conn.execute("UPDATE ci_run SET jobs_synced = 1 WHERE run_id = ?", (run_id,))
 
 
-def insert_gradle_build(conn: sqlite3.Connection, row: dict) -> bool:
-    """Insert a local build row. Returns False if it was a duplicate.
+def insert_gradle_build(conn: sqlite3.Connection, row: dict) -> int | None:
+    """Insert a local build row. Returns its id, or None if it was a duplicate.
 
     The UNIQUE constraint on (project, ts, tasks, duration_ms) is what makes
     re-ingesting the same JSONL a no-op — the byte-offset watermark is the fast
@@ -401,4 +420,24 @@ def insert_gradle_build(conn: sqlite3.Connection, row: dict) -> bool:
         """,
         row,
     )
-    return cur.rowcount > 0
+    return cur.lastrowid if cur.rowcount > 0 else None
+
+
+def insert_gradle_tasks(conn: sqlite3.Connection, build_id: int, project: str,
+                        tasks: list[tuple[str, str, int]]) -> None:
+    """Store a build's per-task detail. A path repeated within one build keeps
+    its first entry."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO gradle_task (build_id, project, path, outcome, duration_ms) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(build_id, project, path, outcome, duration) for path, outcome, duration in tasks],
+    )
+
+
+def prune_gradle_tasks(conn: sqlite3.Connection, before: str) -> int:
+    """Delete per-task rows of builds older than ``before``. Build rows stay."""
+    cur = conn.execute(
+        "DELETE FROM gradle_task WHERE build_id IN (SELECT id FROM gradle_build WHERE ts < ?)",
+        (before,),
+    )
+    return cur.rowcount

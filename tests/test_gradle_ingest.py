@@ -175,3 +175,69 @@ class TestIngest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTaskDetail(TestIngest):
+    """Per-task timings carried on the build line (schema v4)."""
+
+    def recent(self, days=1):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def tasks(self):
+        return self.conn.execute(
+            "SELECT path, outcome, duration_ms FROM gradle_task ORDER BY path").fetchall()
+
+    def test_task_detail_is_stored_against_its_build(self):
+        self.append({**ROW, "ts": self.recent(), "task_detail": [
+            [":app:compileKotlin", "executed", 4200],
+            [":app:test", "from_cache", 150],
+        ]})
+        self.assertEqual(self.run_ingest().tasks, 2)
+        self.assertEqual([tuple(r) for r in self.tasks()],
+                         [(":app:compileKotlin", "executed", 4200), (":app:test", "from_cache", 150)])
+        build_id = self.conn.execute("SELECT id FROM gradle_build").fetchone()[0]
+        self.assertEqual({r[0] for r in self.conn.execute("SELECT build_id FROM gradle_task")}, {build_id})
+
+    def test_rows_without_detail_still_ingest(self):
+        self.append({**ROW, "ts": self.recent()})
+        stats = self.run_ingest()
+        self.assertEqual((stats.inserted, stats.tasks), (1, 0))
+
+    def test_malformed_entries_are_dropped_not_fatal(self):
+        self.assertEqual(gi.map_tasks({"task_detail": [
+            [":ok", "up_to_date", 120],
+            [":bad-outcome", "weird", 1], [":neg", "executed", -1], ["", "executed", 1],
+            [":short", "executed"], "nope", [1, "executed", 5],
+        ]}), [(":ok", "up_to_date", 120)])
+        self.assertEqual(gi.map_tasks({"task_detail": "x"}), [])
+
+    def test_replayed_line_does_not_duplicate_tasks(self):
+        line = {**ROW, "ts": self.recent(), "task_detail": [[":a", "executed", 500]]}
+        self.append(line)
+        self.run_ingest()
+        db.set_state(self.conn, gi.OFFSET_KEY, "0")
+        self.run_ingest()
+        self.assertEqual(len(self.tasks()), 1)
+
+    def test_old_task_rows_are_pruned_but_builds_kept(self):
+        self.append({**ROW, "ts": self.recent(db.GRADLE_TASK_DAYS + 5), "task_detail": [[":old", "executed", 500]]},
+                    {**ROW, "ts": self.recent(1), "task_detail": [[":new", "executed", 500]]})
+        self.run_ingest()
+        self.assertEqual([r["path"] for r in self.tasks()], [":new"])
+        self.assertEqual(self.count(), 2)
+
+
+class TestSchemaV4Migration(unittest.TestCase):
+    def test_a_v3_database_gains_the_task_table(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite"
+            db.connect(path).close()  # a full schema, then wound back to v3
+            raw = sqlite3.connect(path)
+            raw.executescript("DROP TABLE gradle_task; PRAGMA user_version = 3;")
+            raw.close()
+            conn = db.connect(path)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            conn.execute("SELECT build_id, path, outcome, duration_ms FROM gradle_task").fetchall()
+            conn.close()
