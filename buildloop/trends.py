@@ -12,7 +12,9 @@ median far more than a real regression does.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 from .dashboard import percentile, week_start
 from .humanize import ms
@@ -36,7 +38,8 @@ OUTLIER_RATIO = 10
 OUTLIER_RULE = (
     f"a build is excluded from median/p90 when it took over {OUTLIER_CAP_MS // 3_600_000}h, "
     f"or over {OUTLIER_FLOOR_MS // 3_600_000}h and over {OUTLIER_RATIO}x the median of the "
-    "same task set and measured_from across all stored builds (machine sleep, not build time)"
+    "successful builds of the same task set and measured_from across all stored builds "
+    "(machine sleep, not build time)"
 )
 
 MEASURES = ("build_start", "execution")
@@ -48,6 +51,19 @@ def window_start(today: date | None = None, weeks: int = WEEKS) -> str:
     today = today or datetime.now(timezone.utc).date()
     monday = today - timedelta(days=today.weekday())
     return (monday - timedelta(weeks=weeks - 1)).isoformat()
+
+
+def this_week(today: date | None = None) -> str:
+    """Monday of the current week: its bucket is still filling, so it is
+    marked ``partial`` rather than read as a drop in runs or failures."""
+    return window_start(today, weeks=1)
+
+
+def _bucket(week_of: str, current: str, **fields: Any) -> dict:
+    row = {"week_of": week_of, **fields}
+    if week_of == current:
+        row["partial"] = True
+    return row
 
 
 # --- CI steps ---------------------------------------------------------------
@@ -87,12 +103,13 @@ def ci_step_weekly(conn: sqlite3.Connection, project: str, *,
         series.setdefault(key, {}).setdefault(wk, []).append(r["duration_ms"])
         totals[key] = totals.get(key, 0) + r["duration_ms"]
 
-    ranked = sorted(totals, key=lambda k: -totals[k])[:top]
+    ranked = sorted(totals, key=lambda k: (-totals[k], k))[:top]
     history = conn.execute(
         "SELECT MIN(j.started_at) FROM ci_step s JOIN ci_job j ON j.job_id = s.job_id "
         "WHERE s.project = ?",
         (project,),
     ).fetchone()[0]
+    current = this_week()
     return {
         "counts": "successful steps of jobs that started; skipped, failed and cancelled "
                   "steps are left out. Bucketed by the job's start.",
@@ -102,8 +119,8 @@ def ci_step_weekly(conn: sqlite3.Connection, project: str, *,
                 "workflow": k[0], "job": k[1], "step": k[2],
                 "total_time": ms(totals[k]),
                 "weeks": [
-                    {"week_of": wk, "samples": len(v),
-                     "median": ms(percentile(v, 0.5)), "p90": ms(percentile(v, 0.9))}
+                    _bucket(wk, current, samples=len(v),
+                            median=ms(percentile(v, 0.5)), p90=ms(percentile(v, 0.9)))
                     for wk, v in sorted(series[k].items())
                 ],
             }
@@ -114,15 +131,18 @@ def ci_step_weekly(conn: sqlite3.Connection, project: str, *,
 
 # --- local task sets --------------------------------------------------------
 
-def outliers(builds) -> set[int]:
+def outliers(builds: Sequence[Mapping[str, Any]]) -> set[int]:
     """Row ids of wall-clock outliers among ``builds`` (see ``OUTLIER_RULE``).
 
     ``builds`` must hold every stored build of the series it is judging, not
-    just a window: the reference median is the series' whole history.
+    just a window: the reference median is the series' whole history. Only
+    successful builds set the reference: a failed build stops early, and
+    counting it would pull the median down and flag long successful builds.
     """
     by_series: dict[tuple, list[int]] = {}
     for b in builds:
-        if b["duration_ms"] is not None and b["duration_ms"] <= OUTLIER_CAP_MS:
+        if (b["outcome"] == "success" and b["duration_ms"] is not None
+                and b["duration_ms"] <= OUTLIER_CAP_MS):
             by_series.setdefault((b["tasks"], b["measured_from"]), []).append(b["duration_ms"])
     reference = {k: percentile(v, 0.5) for k, v in by_series.items()}
 
@@ -167,6 +187,7 @@ def local_task_set_weekly(conn: sqlite3.Connection, project: str, *,
         runs[key] = runs.get(key, 0) + 1
     ranked = sorted(runs, key=lambda k: (-runs[k], k))[:top]
 
+    current = this_week()
     out = []
     for key in ranked:
         weeks: dict[str, list] = {}
@@ -180,15 +201,15 @@ def local_task_set_weekly(conn: sqlite3.Connection, project: str, *,
             durations = [b["duration_ms"] for b in group
                          if b["outcome"] == "success" and b["duration_ms"] is not None
                          and b["id"] not in flagged]
-            rows.append({
-                "week_of": wk,
-                "runs": len(group),
-                "failed": sum(1 for b in group if b["outcome"] == "failed"),
-                "samples": len(durations),
-                "median": ms(percentile(durations, 0.5)),
-                "p90": ms(percentile(durations, 0.9)),
-                "outliers_excluded": len(excluded),
-            })
+            rows.append(_bucket(
+                wk, current,
+                runs=len(group),
+                failed=sum(1 for b in group if b["outcome"] == "failed"),
+                samples=len(durations),
+                median=ms(percentile(durations, 0.5)),
+                p90=ms(percentile(durations, 0.9)),
+                outliers_excluded=len(excluded),
+            ))
         out.append({"tasks": key[0], "measured_from": key[1], "runs": runs[key], "weeks": rows})
 
     return {
@@ -215,33 +236,44 @@ def gradle_task_weekly(conn: sqlite3.Connection, project: str, *,
     split counts every recorded run.
     """
     since = since or window_start()
-    rows = conn.execute(
+    # Rank in SQL so only the top paths' rows are loaded, not every task row
+    # in the window.
+    top_rows = conn.execute(
         """
-        SELECT t.build_id, t.path, t.outcome, t.duration_ms, b.ts
+        SELECT t.path, SUM(t.duration_ms) AS total
         FROM gradle_task t JOIN gradle_build b ON b.id = t.build_id
         WHERE t.project = ? AND b.ts >= ?
+        GROUP BY t.path
+        ORDER BY total DESC, t.path
+        LIMIT ?
         """,
-        (project, since),
+        (project, since, top),
     ).fetchall()
-    if not rows:
+    if not top_rows:
         return None
+    ranked = [r["path"] for r in top_rows]
+    totals = {r["path"]: r["total"] for r in top_rows}
+    marks = ", ".join("?" * len(ranked))
+    rows = conn.execute(
+        f"""
+        SELECT t.build_id, t.path, t.outcome, t.duration_ms, b.ts
+        FROM gradle_task t JOIN gradle_build b ON b.id = t.build_id
+        WHERE t.project = ? AND b.ts >= ? AND t.path IN ({marks})
+        """,
+        (project, since, *ranked),
+    ).fetchall()
     builds = conn.execute(
-        "SELECT id, tasks, duration_ms, measured_from FROM gradle_build WHERE project = ?",
+        "SELECT id, tasks, duration_ms, measured_from, outcome FROM gradle_build "
+        "WHERE project = ?",
         (project,),
     ).fetchall()
     flagged = outliers(builds)
 
-    totals: dict[str, int] = {}
-    for r in rows:
-        totals[r["path"]] = totals.get(r["path"], 0) + r["duration_ms"]
-    ranked = sorted(totals, key=lambda p: (-totals[p], p))[:top]
-    wanted = set(ranked)
-
     weeks: dict[str, dict[str, list]] = {p: {} for p in ranked}
     for r in rows:
-        if r["path"] in wanted:
-            weeks[r["path"]].setdefault(week_start(r["ts"]), []).append(r)
+        weeks[r["path"]].setdefault(week_start(r["ts"]), []).append(r)
 
+    current = this_week()
     out = []
     for path in ranked:
         series = []
@@ -251,14 +283,14 @@ def gradle_task_weekly(conn: sqlite3.Connection, project: str, *,
                      if r["outcome"] == "executed" and r["build_id"] not in flagged]
             split = {o: sum(1 for r in group if r["outcome"] == o)
                      for o in ("executed", "from_cache", "up_to_date", "failed")}
-            series.append({
-                "week_of": wk,
-                "runs": len(group),
-                "samples": len(timed),
-                "median_executed": ms(percentile(timed, 0.5)),
-                "p90_executed": ms(percentile(timed, 0.9)),
+            series.append(_bucket(
+                wk, current,
+                runs=len(group),
+                samples=len(timed),
+                median_executed=ms(percentile(timed, 0.5)),
+                p90_executed=ms(percentile(timed, 0.9)),
                 **split,
-            })
+            ))
         out.append({"task": path, "total_time": ms(totals[path]), "weeks": series})
 
     history = conn.execute(

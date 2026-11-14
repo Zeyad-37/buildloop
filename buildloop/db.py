@@ -26,7 +26,12 @@ UNREAD = "unread"
 
 #: How long per-task rows are kept. Build rows are kept forever; task rows are
 #: two orders of magnitude more numerous and only feed the 26-week trend.
-GRADLE_TASK_DAYS = 180
+#: Must cover ``trends.window_start()`` plus the current day: the window starts
+#: on the Monday 25 weeks before this one, up to 26 * 7 days back, so anything
+#: shorter empties the oldest bucket late in the week. Spelled out rather than
+#: imported, because ``trends`` imports ``dashboard``, which imports this module;
+#: ``tests/test_trends.py`` pins the two together.
+GRADLE_TASK_DAYS = 26 * 7 + 7
 #: Outcomes the init script writes for a task.
 TASK_OUTCOMES = ("executed", "from_cache", "up_to_date", "skipped", "failed")
 

@@ -27,6 +27,15 @@ class TestWindow(unittest.TestCase):
         self.assertEqual(start, "2026-05-18")  # this Monday (11-09) and 25 before it
         self.assertEqual(date.fromisoformat(start).weekday(), 0)
 
+    def test_task_retention_covers_the_window_on_every_weekday(self):
+        self.assertGreaterEqual(db.GRADLE_TASK_DAYS, trends.WEEKS * 7 + 7)
+        for offset in range(7):
+            d = date(2026, 11, 9) + timedelta(days=offset)  # Monday through Sunday
+            end_of_day = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc)
+            cutoff = end_of_day - timedelta(days=db.GRADLE_TASK_DAYS)
+            start = datetime.fromisoformat(trends.window_start(d)).replace(tzinfo=timezone.utc)
+            self.assertLessEqual(cutoff, start, d.isoformat())
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -43,7 +52,9 @@ class Base(unittest.TestCase):
         return self.ids
 
 
-class TestCiStepWeekly(Base):
+class CiJobs:
+    """Helper for tests that need CI runs; holds no tests of its own."""
+
     def add_job(self, started, steps, workflow="Verify PRs", job="build", started_at=True):
         run_id, job_id = self.next_id(), self.next_id()
         db.upsert_run(self.conn, {
@@ -62,6 +73,8 @@ class TestCiStepWeekly(Base):
                                        "name": name, "conclusion": conclusion,
                                        "duration_ms": duration})
 
+
+class TestCiStepWeekly(CiJobs, Base):
     def test_weekly_median_p90_and_samples_per_step(self):
         wk = monday(2)
         for minutes in (1, 2, 3, 4, 10):
@@ -113,6 +126,20 @@ class TestCiStepWeekly(Base):
     def test_none_without_steps(self):
         self.assertIsNone(trends.ci_step_weekly(self.conn, "p"))
 
+    def test_equal_totals_come_back_in_key_order(self):
+        wk = iso(monday(1))
+        for name in ("zeta", "alpha", "mid"):
+            self.add_job(wk, [(name, "success", MIN)])
+        out = trends.ci_step_weekly(self.conn, "p")
+        self.assertEqual([s["step"] for s in out["steps"]], ["alpha", "mid", "zeta"])
+
+    def test_only_the_current_week_is_marked_partial(self):
+        self.add_job(iso(monday(1)), [("Test", "success", MIN)])
+        self.add_job(iso(monday(0), 0), [("Test", "success", MIN)])
+        weeks = trends.ci_step_weekly(self.conn, "p")["steps"][0]["weeks"]
+        self.assertEqual([(w["week_of"], w.get("partial")) for w in weeks],
+                         [(monday(1).isoformat(), None), (monday(0).isoformat(), True)])
+
 
 class TestLocalTaskSetWeekly(Base):
     def add_build(self, d, tasks, duration, measured_from="build_start", outcome="success", hour=12):
@@ -160,7 +187,8 @@ class TestLocalTaskSetWeekly(Base):
 
     def test_outlier_rule(self):
         def b(i, tasks, d, mf="build_start"):
-            return {"id": i, "tasks": tasks, "duration_ms": d, "measured_from": mf}
+            return {"id": i, "tasks": tasks, "duration_ms": d, "measured_from": mf,
+                    "outcome": "success"}
         builds = [
             b(1, "quick", 5_000), b(2, "quick", 6_000), b(11, "quick", 7_000), b(12, "quick", 8_000),
             b(3, "quick", 40 * MIN),                                               # under floor: kept
@@ -171,6 +199,23 @@ class TestLocalTaskSetWeekly(Base):
             b(10, "quick", None),
         ]
         self.assertEqual(trends.outliers(builds), {4, 8})
+
+    def test_outlier_reference_is_the_median_of_successful_builds(self):
+        def b(i, d, outcome="success"):
+            return {"id": i, "tasks": "test", "duration_ms": d, "measured_from": "build_start",
+                    "outcome": outcome}
+        builds = [b(1, 20 * MIN), b(2, 20 * MIN), b(3, 2 * HOUR)]
+        builds += [b(10 + i, MIN, "failed") for i in range(5)]
+        # With the failed builds the median is 1m and the 2h build is >10x it;
+        # successful builds alone put it at 20m, so the 2h build is kept.
+        self.assertEqual(trends.outliers(builds), set())
+
+    def test_only_the_current_week_is_marked_partial(self):
+        self.add_build(monday(1), "a", 10_000)
+        self.add_build(monday(0), "a", 10_000, hour=0)
+        weeks = trends.local_task_set_weekly(self.conn, "p")["task_sets"][0]["weeks"]
+        self.assertEqual([(w["week_of"], w.get("partial")) for w in weeks],
+                         [(monday(1).isoformat(), None), (monday(0).isoformat(), True)])
 
     def test_most_run_task_sets_first_and_limited(self):
         wk = monday(1)
@@ -189,7 +234,7 @@ class TestLocalTaskSetWeekly(Base):
                          [(monday(2).isoformat(), "10s"), (monday(1).isoformat(), "20s")])
 
 
-class TestAskContext(TestCiStepWeekly):
+class TestAskContext(CiJobs, Base):
     def test_new_series_reach_the_question_context_and_existing_fields_stay(self):
         self.add_job(iso(monday(1)), [("Test", "success", MIN)])
         db.insert_gradle_build(self.conn, {
@@ -205,10 +250,6 @@ class TestAskContext(TestCiStepWeekly):
         self.assertIn("slow_steps", ctx["ci"])
         self.assertIn("task_sets", ctx["local"])
         json.dumps(ctx)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestGradleTaskWeekly(Base):
@@ -265,3 +306,21 @@ class TestGradleTaskWeekly(Base):
     def test_reaches_the_question_context(self):
         self.add(monday(1), [(":a", "executed", 1_000)])
         self.assertIn("local_task_weekly_last_26_weeks", ask.build_context(self.conn, "p"))
+
+    def test_ranking_ties_break_on_path_and_skip_tasks_outside_the_window(self):
+        self.add(monday(40), [(":old", "executed", 99_000)], hour=1)
+        self.add(monday(1), [(":z", "executed", 2_000), (":y", "executed", 2_000),
+                             (":x", "executed", 1_000)], hour=2)
+        out = trends.gradle_task_weekly(self.conn, "p", top=2)
+        self.assertEqual([t["task"] for t in out["tasks"]], [":y", ":z"])
+
+    def test_only_the_current_week_is_marked_partial(self):
+        self.add(monday(1), [(":a", "executed", 1_000)], hour=1)
+        self.add(monday(0), [(":a", "executed", 1_000)], hour=0)
+        weeks = trends.gradle_task_weekly(self.conn, "p")["tasks"][0]["weeks"]
+        self.assertEqual([(w["week_of"], w.get("partial")) for w in weeks],
+                         [(monday(1).isoformat(), None), (monday(0).isoformat(), True)])
+
+
+if __name__ == "__main__":
+    unittest.main()
