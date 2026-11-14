@@ -58,6 +58,7 @@ import java.lang.management.ManagementFactory
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
@@ -93,6 +94,15 @@ abstract class BuildLoopCollector :
     private val anyTaskFailed = AtomicBoolean(false)
     private val written = AtomicBoolean(false)
 
+    /**
+     * Per-task detail: path, outcome, duration. Only tasks that took at least
+     * TASK_DETAIL_MIN_MS are kept — a large build finishes ~2,700 tasks, nearly
+     * all of them sub-millisecond up-to-date checks, and storing every one
+     * would add ~140k rows a day for no insight. The counters above still
+     * cover every task.
+     */
+    private val taskDetail = ConcurrentLinkedQueue<String>()
+
     @Volatile private var firstTaskStartMs: Long = Long.MAX_VALUE
     @Volatile private var lastTaskEndMs: Long = Long.MIN_VALUE
 
@@ -104,18 +114,24 @@ abstract class BuildLoopCollector :
                 if (event.result.startTime < firstTaskStartMs) firstTaskStartMs = event.result.startTime
                 if (event.result.endTime > lastTaskEndMs) lastTaskEndMs = event.result.endTime
             }
-            when (val result = event.result) {
+            val outcome = when (val result = event.result) {
                 is TaskSuccessResult -> when {
-                    result.isFromCache -> fromCache.incrementAndGet()
-                    result.isUpToDate -> upToDate.incrementAndGet()
-                    else -> executed.incrementAndGet()
+                    result.isFromCache -> { fromCache.incrementAndGet(); "from_cache" }
+                    result.isUpToDate -> { upToDate.incrementAndGet(); "up_to_date" }
+                    else -> { executed.incrementAndGet(); "executed" }
                 }
-                is TaskSkippedResult -> Unit
+                is TaskSkippedResult -> "skipped"
                 is TaskFailureResult -> {
                     anyTaskFailed.set(true)
                     executed.incrementAndGet() // a failed task did run
+                    "failed"
                 }
-                else -> executed.incrementAndGet()
+                else -> { executed.incrementAndGet(); "executed" }
+            }
+            val taskMs = event.result.endTime - event.result.startTime
+            if (taskMs >= BuildLoopConfig.TASK_DETAIL_MIN_MS) {
+                // Pre-rendered here so close() only joins strings.
+                taskDetail.add("[\"${escape(event.descriptor.taskPath)}\",\"$outcome\",$taskMs]")
             }
         } catch (ignored: Throwable) {
             // Never let accounting break a build.
@@ -192,12 +208,25 @@ abstract class BuildLoopCollector :
             append(',')
             appendField("gradle_version", parameters.gradleVersion.get())
             append(",\"daemon_reused\":").append(daemonReused?.toString() ?: "null")
+            append(",\"task_detail_min_ms\":").append(BuildLoopConfig.TASK_DETAIL_MIN_MS)
+            append(",\"task_detail\":[")
+            taskDetail.forEachIndexed { i, t ->
+                if (i > 0) append(',')
+                append(t)
+            }
+            append(']')
             append('}')
             append('\n')
         }
 
         // One write() call on an O_APPEND handle: concurrent builds interleave
-        // whole lines rather than corrupting each other's.
+        // whole lines rather than corrupting each other's. With task_detail a
+        // line can be tens of KB on a big clean build. POSIX promises atomicity
+        // only for pipes (PIPE_BUF), but a local filesystem moves the offset to
+        // EOF and copies the buffer under one inode lock, so a single write of
+        // this size still lands whole. If malformed lines ever show up under
+        // concurrent builds (e.g. home on a network mount), suspect this first;
+        // ingest skips and counts them rather than failing.
         FileOutputStream(File(home, "builds.jsonl"), true).use {
             it.write(json.toByteArray(Charsets.UTF_8))
         }
@@ -308,6 +337,9 @@ object BuildLoopConfig {
 
     /** A fresh daemon's first build has uptime ~= startup + build; a reused one has far more. */
     const val DAEMON_FRESH_SLACK_MS = 15_000L
+
+    /** Tasks faster than this are counted but not recorded individually. */
+    const val TASK_DETAIL_MIN_MS = 100L
 
     /**
      * Is the configuration cache on for this build?

@@ -211,7 +211,7 @@ Answers are inserted into the page as text, never as HTML.
           └──────────────┬────────────────────┘
                          ▼
           ~/.buildloop/buildloop.sqlite
-          ci_run / ci_job / ci_step / gradle_build
+          ci_run / ci_job / ci_step / gradle_build / gradle_task
                          │  generate
                          ▼
           dashboard-<project>.html

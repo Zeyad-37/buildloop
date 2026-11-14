@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 OFFSET_KEY = "gradle_jsonl_offset"
@@ -33,11 +34,14 @@ class IngestStats:
     inserted: int = 0
     duplicates: int = 0
     malformed: int = 0
+    tasks: int = 0
     unknown_project: int = 0
     consumed_bytes: int = 0
 
     def __str__(self) -> str:
         parts = [f"{self.inserted} build(s)"]
+        if self.tasks:
+            parts.append(f"{self.tasks} task timing(s)")
         if self.duplicates:
             parts.append(f"{self.duplicates} already stored")
         if self.malformed:
@@ -84,6 +88,28 @@ def map_row(raw: dict) -> dict | None:
     gv = raw.get("gradle_version")
     row["gradle_version"] = gv if isinstance(gv, str) else None
     return row
+
+
+def map_tasks(raw: dict) -> list[tuple[str, str, int]]:
+    """The ``task_detail`` entries of one JSONL object, malformed ones dropped.
+
+    Absent on builds written before per-task collection: an empty list.
+    """
+    from .db import TASK_OUTCOMES
+
+    detail = raw.get("task_detail") if isinstance(raw, dict) else None
+    if not isinstance(detail, list):
+        return []
+    out = []
+    for entry in detail:
+        if not isinstance(entry, list) or len(entry) != 3:
+            continue
+        path, outcome, duration = entry
+        duration = _as_int(duration)
+        if isinstance(path, str) and path and outcome in TASK_OUTCOMES and duration is not None \
+                and duration >= 0:
+            out.append((path, outcome, duration))
+    return out
 
 
 def _as_int(value) -> int | None:
@@ -142,12 +168,19 @@ def ingest(conn: sqlite3.Connection, jsonl_path: Path, known_projects: set[str],
         if row["project"] not in known_projects:
             stats.unknown_project += 1
             continue
-        if db.insert_gradle_build(conn, row):
-            stats.inserted += 1
-        else:
+        build_id = db.insert_gradle_build(conn, row)
+        if build_id is None:
             stats.duplicates += 1
+            continue
+        stats.inserted += 1
+        tasks = map_tasks(raw)
+        if tasks:
+            db.insert_gradle_tasks(conn, build_id, row["project"], tasks)
+            stats.tasks += len(tasks)
 
     stats.consumed_bytes = consumed
+    cutoff = datetime.now(timezone.utc) - timedelta(days=db.GRADLE_TASK_DAYS)
+    db.prune_gradle_tasks(conn, cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
     db.set_state(conn, offset_key, str(offset + consumed))
     conn.commit()
     return stats
