@@ -79,7 +79,9 @@ class TestMapRow(unittest.TestCase):
         self.assertIsNone(gi.map_row([]))
 
 
-class TestIngest(unittest.TestCase):
+class IngestFixture:
+    """A temp home, builds.jsonl and database; holds no tests of its own."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
@@ -102,6 +104,8 @@ class TestIngest(unittest.TestCase):
     def count(self):
         return self.conn.execute("SELECT COUNT(*) FROM gradle_build").fetchone()[0]
 
+
+class TestIngest(IngestFixture, unittest.TestCase):
     def test_missing_file_is_not_an_error(self):
         self.assertEqual(self.run_ingest().inserted, 0)
 
@@ -173,11 +177,7 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(stats.malformed, 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class TestTaskDetail(TestIngest):
+class TestTaskDetail(IngestFixture, unittest.TestCase):
     """Per-task timings carried on the build line (schema v4)."""
 
     def recent(self, days=1):
@@ -241,3 +241,7 @@ class TestSchemaV4Migration(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             conn.execute("SELECT build_id, path, outcome, duration_ms FROM gradle_task").fetchall()
             conn.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

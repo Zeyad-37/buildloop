@@ -220,7 +220,13 @@ abstract class BuildLoopCollector :
         }
 
         // One write() call on an O_APPEND handle: concurrent builds interleave
-        // whole lines rather than corrupting each other's.
+        // whole lines rather than corrupting each other's. With task_detail a
+        // line can be tens of KB on a big clean build. POSIX promises atomicity
+        // only for pipes (PIPE_BUF), but a local filesystem moves the offset to
+        // EOF and copies the buffer under one inode lock, so a single write of
+        // this size still lands whole. If malformed lines ever show up under
+        // concurrent builds (e.g. home on a network mount), suspect this first;
+        // ingest skips and counts them rather than failing.
         FileOutputStream(File(home, "builds.jsonl"), true).use {
             it.write(json.toByteArray(Charsets.UTF_8))
         }
