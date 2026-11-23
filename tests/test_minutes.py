@@ -124,6 +124,28 @@ class TestWhere(_Db):
         (_, where), = minutes.runs_where(minutes.jobs(self.conn, "p")).values()
         self.assertEqual(where, minutes.HOSTED)
 
+    def refuse(self, runner):
+        """Mark the jobs on ``runner`` as refused for budget."""
+        for (job_id,) in self.conn.execute("SELECT job_id FROM ci_job WHERE runner = ?", (runner,)):
+            self.conn.execute("UPDATE ci_job SET conclusion = 'failure' WHERE job_id = ?", (job_id,))
+            db.upsert_failure(self.conn, {"job_id": job_id, "project": "p", "step": None,
+                                          "reason": "budget", "signature": None, "excerpt": None,
+                                          "cause": db.BUDGET})
+
+    def test_a_job_refused_for_budget_does_not_decide_where_a_run_ran(self):
+        # It asked for a hosted runner and never got one; the run ran self-hosted.
+        self.add_run(1, jobs=[(3_000, "ubuntu-latest"), (60_000, MINI)])
+        self.refuse("ubuntu-latest")
+        (_, where), = minutes.runs_where(minutes.jobs(self.conn, "p")).values()
+        self.assertEqual(where, minutes.SELF_HOSTED)
+
+    def test_a_run_whose_only_job_was_refused_is_hosted(self):
+        self.add_run(1, jobs=[(3_000, "ubuntu-latest")])
+        self.refuse("ubuntu-latest")
+        ((start, where),) = minutes.runs_where(minutes.jobs(self.conn, "p")).values()
+        self.assertEqual(where, minutes.HOSTED)
+        self.assertIsNotNone(start)
+
     def test_totals_split_minutes_by_where(self):
         self.add_run(1, jobs=[(120_000, "ubuntu-latest"), (60_000, MINI)])
         t = minutes.totals(minutes.jobs(self.conn, "p"))

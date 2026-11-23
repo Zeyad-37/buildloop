@@ -401,6 +401,23 @@ class TestBudget(DbCase):
         self.assertIn(tile + "13 min", everything)
         self.assertIn(tile + "10 min", excluded)
 
+    def test_a_run_that_overflowed_to_self_hosted_is_in_the_self_hosted_view(self):
+        # Run 1 is blocked outright, so both budget views exist. Run 2's hosted
+        # job was refused and its self-hosted job ran and failed on its own.
+        self.add_run(1, 60, exec_ms=3_000)
+        self.add_blocked(1, 1, "build", 60, 59)
+        self.add_run(2, 50, exec_ms=420_000)
+        self.add_blocked(2, 2, "build", 50, 49)
+        self.add_job(3, 2, "build-mac", 50, 43)
+        self.conn.execute("UPDATE ci_job SET runner = 'self-hosted,macOS,ARM64' WHERE job_id = 3")
+        self.add_failure(3, "Detekt found new issues")
+        self.assertEqual(db.budget_blocked_runs(self.conn, "p"), {1})
+        page = dashboard.render(self.conn, "p")
+        for budget in ("all", "x"):
+            view = page.split(f'data-budget="{budget}" data-runner="self" hidden>')[1]
+            view = view.split('<div class="view"')[0]
+            self.assertIn("<dt>Median CI run</dt><dd>7m", view, budget)
+
     def test_excluded_view_drops_blocked_jobs_from_failures_by_job(self):
         self.add_blocked(1, 1, "build", 60, 59)
         self.add_job(2, 2, "build", 40, 30)

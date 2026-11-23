@@ -28,6 +28,8 @@ import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
+from . import db
+
 LINUX, WINDOWS, MACOS, SELF_HOSTED, OTHER = "Linux", "Windows", "macOS", "self-hosted", "other"
 
 #: Series order on the chart and in summaries: GitHub-hosted first, cheapest
@@ -73,13 +75,18 @@ def runner_where(runner: str | None) -> str:
 def runs_where(rows: Iterable[sqlite3.Row]) -> dict[int, tuple[str, str]]:
     """Each run in ``rows`` (from ``jobs``) as ``(first job start, where)``.
 
-    Decided by the jobs that used a runner, which is all ``jobs`` returns: a
-    skipped job carries the label it asked for but never ran anywhere.
+    Decided by the jobs that used a runner: a skipped job (which ``jobs``
+    leaves out) and a job GitHub refused to start for want of budget both
+    carry the label they asked for but never ran anywhere. A refused job still
+    marks the run's start, and a run whose every job was refused is hosted:
+    only hosted minutes have a budget.
     """
     seen: dict[int, tuple[str, set[str]]] = {}
     for r in rows:  # oldest first, so the first row of a run is its start
-        seen.setdefault(r["run_id"], (r["started_at"], set()))[1].add(runner_where(r["runner"]))
-    return {run_id: (start, MIXED if len(kinds) > 1 else next(iter(kinds)))
+        _, kinds = seen.setdefault(r["run_id"], (r["started_at"], set()))
+        if r["cause"] != db.BUDGET:
+            kinds.add(runner_where(r["runner"]))
+    return {run_id: (start, MIXED if len(kinds) > 1 else next(iter(kinds), HOSTED))
             for run_id, (start, kinds) in seen.items()}
 
 
