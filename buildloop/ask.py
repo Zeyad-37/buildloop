@@ -67,6 +67,7 @@ def _weekly_minutes(conn: sqlite3.Connection, project: str, cutoff: str) -> list
             "week_of": wk,
             "total": mins(t["total"]),
             "by_runner_os": {k: mins(v) for k, v in t["by_os"].items()},
+            "hosted_vs_self_hosted": {k: mins(v) for k, v in t["by_where"].items()},
         })
     return out
 
