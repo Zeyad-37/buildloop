@@ -577,7 +577,9 @@ def _runner_toggle() -> str:
         f'<fieldset class="runners"><legend>Runners</legend>{options}'
         f"<small>Where a run ran is read from its jobs, which go back {JOB_WINDOW_DAYS} days: older "
         "runs, and runs whose jobs were all skipped, count as hosted. A run split between the two "
-        "is only under All. Slowest steps always covers both.</small></fieldset>"
+        "is only under All in the run figures (duration, p90, queue, failure rate); CI minutes, "
+        "Failures by job and Why CI fails count each job on the runner it used. Slowest steps "
+        "always covers both.</small></fieldset>"
     )
 
 

@@ -130,7 +130,9 @@ together, along with the two hosted vs self-hosted views above. Anything
 without that label, third-party runner services included, counts as hosted.
 Where a run ran is read from its jobs, so runs older than the 90 days jobs are
 read for count as hosted, and a run whose jobs were split between the two is
-only under All. The CI minutes figure also says how many of its minutes were
+only under All in the run figures (duration, p90, queue and failure rate). CI
+minutes, Failures by job and Why CI fails are counted per job, so each job of
+such a run is under the runner it used. The CI minutes figure also says how many of its minutes were
 self-hosted, which GitHub does not bill.
 
 **Local Gradle**
