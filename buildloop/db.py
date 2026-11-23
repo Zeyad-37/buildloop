@@ -15,8 +15,6 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import minutes
-
 SCHEMA_VERSION = 4
 
 #: ``ci_failure.cause`` for a job GitHub refused to start because an Actions
@@ -25,6 +23,20 @@ SCHEMA_VERSION = 4
 BUDGET = "budget"
 #: A row diagnosed before annotations were read, which may be one of those.
 UNREAD = "unread"
+
+#: SQL for "this job ran on a self-hosted runner", over a ``ci_job`` aliased
+#: ``j``: the ``self-hosted`` label among ``j.runner``'s comma-joined labels.
+#: The one definition queries use; ``minutes.runner_where`` is the same test
+#: in Python, and ``tests/test_minutes.py`` pins the two together. Whitespace
+#: is dropped as ``strip()`` drops it around each label (GitHub labels contain
+#: none of their own).
+SELF_HOSTED_SQL = (
+    "(',' || REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE(j.runner, '')),"
+    " ' ', ''), char(9), ''), char(10), ''), char(13), '') || ',')"
+    " LIKE '%,self-hosted,%'"
+)
+#: ``minutes.SELF_HOSTED``, spelled out because ``minutes`` imports this module.
+_SELF_HOSTED = "self-hosted"
 
 #: How long per-task rows are kept. Build rows are kept forever; task rows are
 #: two orders of magnitude more numerous and only feed the 26-week trend.
@@ -326,9 +338,9 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
     them apart needs the workflow's dependency graph.
     """
     unhappy = conn.execute(
-        """
+        f"""
         SELECT j.job_id, j.run_id, j.run_attempt, j.name AS job, j.conclusion,
-               j.started_at, j.completed_at, j.runner,
+               j.started_at, j.completed_at, ({SELF_HOSTED_SQL}) AS self_hosted,
                f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt, f.cause
         FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
@@ -338,7 +350,7 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
         (project, since),
     ).fetchall()
     failed = [r for r in unhappy if r["conclusion"] == "failure"
-              and (where is None or minutes.runner_where(r["runner"]) == where)]
+              and (where is None or bool(r["self_hosted"]) == (where == _SELF_HOSTED))]
 
     by_run: dict[int, list[sqlite3.Row]] = {}
     for r in unhappy:

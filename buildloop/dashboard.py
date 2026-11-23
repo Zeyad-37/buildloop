@@ -284,14 +284,8 @@ def ci_failure_rate_chart(cid, runs, weeks, workflows) -> Chart:
     )
 
 
-#: SQL for "this job ran on a self-hosted runner": the ``self-hosted`` label
-#: among ``ci_job.runner``'s comma-joined labels, as ``minutes.runner_where``.
-_SELF_HOSTED_SQL = ("(',' || REPLACE(LOWER(COALESCE(j.runner, '')), ' ', '') || ',') "
-                    "LIKE '%,self-hosted,%'")
-
-
-def ci_flaky_jobs_chart(cid, conn, project, exclude_budget: bool = False,
-                        where: str | None = None) -> Chart:
+def ci_flaky_jobs_chart(cid: str, conn: sqlite3.Connection, project: str,
+                        exclude_budget: bool = False, where: str | None = None) -> Chart:
     rows = conn.execute(
         f"""
         SELECT j.name,
@@ -300,7 +294,7 @@ def ci_flaky_jobs_chart(cid, conn, project, exclude_budget: bool = False,
         FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.conclusion IS NOT NULL
           AND NOT (? AND COALESCE(f.cause, '') = ?)
-          AND (? IS NULL OR ({_SELF_HOSTED_SQL}) = ?)
+          AND (? IS NULL OR ({db.SELF_HOSTED_SQL}) = ?)
         GROUP BY j.name
         HAVING failures > 0
         ORDER BY failures DESC
@@ -947,8 +941,9 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
     # been used: on a hosted-only project they would be one bar and no table.
     self_hosted = any(minutes.runner_where(j["runner"]) == minutes.SELF_HOSTED for j in jobs)
 
-    def ci_view(suffix: str, view_runs, view_jobs, exclude_budget: bool,
-                where: str | None, weeks: list[str]) -> tuple[dict[str, Chart], str]:
+    def ci_view(suffix: str, view_runs: list[sqlite3.Row], view_jobs: list[sqlite3.Row],
+                exclude_budget: bool, where: str | None,
+                weeks: list[str]) -> tuple[dict[str, Chart], str]:
         """The CI charts the switches change, plus the reasons table.
 
         The table sits right under "Failures by job": the chart says which

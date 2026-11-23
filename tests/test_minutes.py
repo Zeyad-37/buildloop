@@ -102,6 +102,15 @@ class TestWhere(_Db):
         self.assertEqual(minutes.runner_where("macos-latest"), minutes.HOSTED)
         self.assertEqual(minutes.runner_where("blacksmith-4vcpu-ubuntu-2404"), minutes.HOSTED)
 
+    def test_sql_and_python_agree_on_self_hosted(self):
+        # Queries filter with db.SELF_HOSTED_SQL, everything else with runner_where.
+        for label in (MINI, " Self-Hosted , x64", "self-hosted\t,linux", "self-hosted\r\n",
+                      "ubuntu-latest", "blacksmith-4vcpu-ubuntu-2404", "", None):
+            (in_sql,), = self.conn.execute(
+                f"SELECT {db.SELF_HOSTED_SQL} FROM (SELECT ? AS runner) j", (label,))
+            self.assertEqual(bool(in_sql), minutes.runner_where(label) == minutes.SELF_HOSTED,
+                             repr(label))
+
     def test_a_run_split_between_the_two_is_mixed(self):
         self.add_run(3, jobs=[(60_000, "ubuntu-latest")])
         self.add_run(2, jobs=[(60_000, MINI), (60_000, MINI)])
