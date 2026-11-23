@@ -178,6 +178,89 @@ def ci_minutes_chart(cid: str, jobs: Iterable[sqlite3.Row]) -> Chart:
     )
 
 
+def ci_where_chart(cid: str, jobs: Iterable[sqlite3.Row]) -> Chart:
+    """Runs per week, stacked by where they ran.
+
+    On the minutes chart's weeks, for the same reason: where a run ran is only
+    known from its jobs. A run is placed in the week its first job started.
+    """
+    jobs = list(jobs)
+    weeks = [w for w, _ in weekly_jobs(jobs)]
+    tally: dict[str, dict[str, int]] = {}
+    for start, where in minutes.runs_where(jobs).values():
+        by_week = tally.setdefault(where, {})
+        wk = week_start(start)
+        by_week[wk] = by_week.get(wk, 0) + 1
+    present = [k for k in minutes.WHERE_ORDER if any(w in tally.get(k, {}) for w in weeks)]
+    return charts.stacked_bar_chart(
+        cid, "Where CI ran",
+        "Runs per week on hosted runners and on self-hosted ones. A run is mixed when its jobs "
+        "were split between the two. Runs whose jobs were all skipped ran nowhere and are left out.",
+        weeks,
+        [Series(k, [(w, tally[k].get(w)) for w in weeks]) for k in present],
+        count,
+    )
+
+
+RUNNER_COMPARE_MIN = 3
+
+
+def runner_comparison(jobs: Iterable[sqlite3.Row]) -> list[dict]:
+    """Jobs that succeeded on both kinds of runner, slowest on hosted first.
+
+    Successes only: a failure stops wherever it stops, so its duration says
+    nothing about the machine.
+    """
+    samples: dict[str, dict[str, list[float]]] = {}
+    for j in jobs:
+        if j["conclusion"] == "success":
+            samples.setdefault(j["name"], {}).setdefault(
+                minutes.runner_where(j["runner"]), []).append(j["duration_ms"])
+    rows = []
+    for name, by_where in samples.items():
+        hosted, own = by_where.get(minutes.HOSTED, []), by_where.get(minutes.SELF_HOSTED, [])
+        if min(len(hosted), len(own)) >= RUNNER_COMPARE_MIN:
+            rows.append({"job": name,
+                         "hosted": percentile(hosted, 0.5), "hosted_n": len(hosted),
+                         "self_hosted": percentile(own, 0.5), "self_hosted_n": len(own)})
+    return sorted(rows, key=lambda r: -r["hosted"])
+
+
+def _faster(hosted: float, own: float) -> str:
+    """How the self-hosted median compares, as a person would say it."""
+    if not hosted or not own:
+        return "—"
+    ratio = hosted / own
+    if 0.95 <= ratio <= 1.05:
+        return "about the same"
+    return f"{ratio:.1f}× faster" if ratio > 1 else f"{1 / ratio:.1f}× slower"
+
+
+def ci_runner_comparison(jobs: Iterable[sqlite3.Row], sid: str = "runners") -> str:
+    """The table that says whether the self-hosted runner is faster, job by job."""
+    rows = runner_comparison(jobs)
+    head = (
+        f'<section class="chart compare" id="{charts.esc(sid)}"><figcaption>'
+        "<h3>Same job, hosted vs self-hosted</h3>"
+        f"<p>Median duration of successful jobs in the last {JOB_WINDOW_DAYS} days, for jobs that "
+        f"succeeded at least {RUNNER_COMPARE_MIN} times on each. Time waiting for a free runner is "
+        "not included.</p></figcaption>"
+    )
+    if not rows:
+        return (f'{head}<p class="empty-note">No job has succeeded {RUNNER_COMPARE_MIN} times on '
+                "both kinds of runner yet.</p></section>")
+    body = "".join(
+        f'<tr><th scope="row">{charts.esc(r["job"])}</th>'
+        f'<td>{ms(r["hosted"])} <small>n={r["hosted_n"]:,}</small></td>'
+        f'<td>{ms(r["self_hosted"])} <small>n={r["self_hosted_n"]:,}</small></td>'
+        f'<td>{_faster(r["hosted"], r["self_hosted"])}</td></tr>'
+        for r in rows[:TOP_N]
+    )
+    return (f'{head}<table><thead><tr><th scope="col">Job</th><th scope="col">Hosted</th>'
+            '<th scope="col">Self-hosted</th><th scope="col">Self-hosted is</th></tr></thead>'
+            f"<tbody>{body}</tbody></table></section>")
+
+
 def ci_failure_rate_chart(cid, runs, weeks, workflows) -> Chart:
     series = []
     for wf in workflows:
@@ -201,21 +284,29 @@ def ci_failure_rate_chart(cid, runs, weeks, workflows) -> Chart:
     )
 
 
-def ci_flaky_jobs_chart(cid, conn, project, exclude_budget: bool = False) -> Chart:
+#: SQL for "this job ran on a self-hosted runner": the ``self-hosted`` label
+#: among ``ci_job.runner``'s comma-joined labels, as ``minutes.runner_where``.
+_SELF_HOSTED_SQL = ("(',' || REPLACE(LOWER(COALESCE(j.runner, '')), ' ', '') || ',') "
+                    "LIKE '%,self-hosted,%'")
+
+
+def ci_flaky_jobs_chart(cid, conn, project, exclude_budget: bool = False,
+                        where: str | None = None) -> Chart:
     rows = conn.execute(
-        """
+        f"""
         SELECT j.name,
                SUM(CASE WHEN j.conclusion = 'failure' THEN 1 ELSE 0 END) AS failures,
                COUNT(*) AS total
         FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.conclusion IS NOT NULL
           AND NOT (? AND COALESCE(f.cause, '') = ?)
+          AND (? IS NULL OR ({_SELF_HOSTED_SQL}) = ?)
         GROUP BY j.name
         HAVING failures > 0
         ORDER BY failures DESC
         LIMIT ?
         """,
-        (project, exclude_budget, db.BUDGET, TOP_N),
+        (project, exclude_budget, db.BUDGET, where, where == minutes.SELF_HOSTED, TOP_N),
     ).fetchall()
     return charts.hbar_chart(
         cid, "Failures by job",
@@ -252,10 +343,11 @@ FAILURE_GROUPS = 15
 
 
 def ci_failure_reasons(conn: sqlite3.Connection, project: str, repo: str | None = None,
-                       exclude_budget: bool = False, sid: str = "failures") -> str:
+                       exclude_budget: bool = False, sid: str = "failures",
+                       where: str | None = None) -> str:
     """The table that says what the failures in "Failures by job" actually were."""
     since = (datetime.now(timezone.utc) - timedelta(days=JOB_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    data = db.failure_groups(conn, project, since, exclude_budget=exclude_budget)
+    data = db.failure_groups(conn, project, since, exclude_budget=exclude_budget, where=where)
     head = (
         f'<section class="chart failures" id="{charts.esc(sid)}"><figcaption>'
         "<h3>Why CI fails</h3>"
@@ -477,6 +569,24 @@ def _budget_toggle(runs: int) -> str:
     )
 
 
+def _runner_toggle() -> str:
+    """The switch between the runner views, all pre-rendered like the budget ones.
+
+    Only rendered once a self-hosted runner has been used.
+    """
+    options = "".join(
+        f'<label><input type="radio" name="runner" value="{value}"{checked}> {label}</label>'
+        for value, label, checked in (("all", "All", " checked"), ("hosted", "Hosted", ""),
+                                      ("self", "Self-hosted", ""))
+    )
+    return (
+        f'<fieldset class="runners"><legend>Runners</legend>{options}'
+        f"<small>Where a run ran is read from its jobs, which go back {JOB_WINDOW_DAYS} days: older "
+        "runs, and runs whose jobs were all skipped, count as hosted. A run split between the two "
+        "is only under All. Slowest steps always covers both.</small></fieldset>"
+    )
+
+
 def _summary(runs, builds, jobs, stored: int | None = None) -> str:
     recent = [r for r in runs if r["exec_ms"] is not None][-200:]
     concluded = [r for r in runs if r["conclusion"] is not None][-200:]
@@ -484,13 +594,17 @@ def _summary(runs, builds, jobs, stored: int | None = None) -> str:
     hits = [b for b in builds if b["config_cache"] in ("hit", "miss")]
     hit_rate = 100.0 * sum(1 for b in hits if b["config_cache"] == "hit") / len(hits) if hits else None
     since = (datetime.now(timezone.utc) - timedelta(days=MINUTES_STAT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    used = minutes.totals([j for j in jobs if j["started_at"] >= since])["total"] if jobs else None
+    used = minutes.totals([j for j in jobs if j["started_at"] >= since]) if jobs else None
+    minutes_note = f"last {MINUTES_STAT_DAYS} days"
+    own = used["by_where"].get(minutes.SELF_HOSTED) if used else None
+    if own:
+        minutes_note += f" · {mins(own)} self-hosted"
 
     cells = [
         _stat("CI runs stored", f"{len(runs) if stored is None else stored:,}"),
         _stat("Median CI run", ms(percentile([r["exec_ms"] for r in recent], 0.5)) if recent else "—", "last 200"),
         _stat("CI failure rate", pct(100.0 * failures / len(concluded)) if concluded else "—", "last 200"),
-        _stat("CI minutes", mins(used), f"last {MINUTES_STAT_DAYS} days"),
+        _stat("CI minutes", mins(used["total"] if used else None), minutes_note),
         _stat("Local builds stored", f"{len(builds):,}"),
         _stat("Config-cache hits", pct(hit_rate) if hit_rate is not None else "—", "all time"),
     ]
@@ -522,8 +636,12 @@ h3{font-size:15px;margin:0}
 .toggle{display:flex;gap:9px;align-items:flex-start;margin:16px 0 0;cursor:pointer}
 .toggle input{margin:4px 0 0;accent-color:var(--s0)}
 .toggle small{display:block;color:var(--muted);font-size:12px;max-width:80ch}
-.view-x,body.no-budget .view-all{display:none}
-body.no-budget .view-x{display:block}
+.runners{display:flex;flex-wrap:wrap;gap:4px 16px;margin:16px 0 0;padding:0;border:0}
+.runners legend{float:left;padding:0;margin-right:16px;color:var(--muted)}
+.runners label{cursor:pointer}
+.runners input{accent-color:var(--s0)}
+.runners small{flex-basis:100%;color:var(--muted);font-size:12px;max-width:80ch}
+.view[hidden]{display:none}
 .chart{margin:20px 0;padding:14px 16px 6px;background:var(--card);
   border:1px solid var(--line);border-radius:8px;overflow-x:auto}
 figcaption p{margin:2px 0 0;color:var(--muted);font-size:13px;max-width:72ch}
@@ -589,6 +707,11 @@ svg{display:block;width:100%;height:auto;margin-top:10px;min-width:640px}
   border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
   white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
 .failures a{color:var(--s0)}
+.compare table{width:100%;margin:12px 0 8px;border-collapse:collapse;font-size:13px}
+.compare th,.compare td{padding:7px 10px 7px 0;border-top:1px solid var(--line);text-align:left;
+  font-weight:400;font-variant-numeric:tabular-nums}
+.compare thead th{border-top:0;color:var(--muted);font-size:12px}
+.compare small{color:var(--muted);font-size:11px}
 .muted{color:var(--muted);font-size:12px}
 .failures .muted{margin:4px 0}
 .failures code{font-size:12px;padding:1px 5px;border-radius:4px;background:var(--line)}
@@ -695,19 +818,41 @@ _TOOLTIP_JS = """
 """
 
 
-_BUDGET_JS = """
+_VIEW_JS = """
 (function () {
   var box = document.getElementById('budget-x');
-  if (!box) return;
-  var KEY = 'buildloop:exclude-budget';
-  function apply() { document.body.classList.toggle('no-budget', box.checked); }
+  var radios = document.querySelectorAll('input[name="runner"]');
+  if (!box && !radios.length) return;
+  var BUDGET = 'buildloop:exclude-budget', RUNNER = 'buildloop:runner';
+  function runner() {
+    var value = 'all';
+    radios.forEach(function (r) { if (r.checked) value = r.value; });
+    return value;
+  }
+  // Every combination is already in the page; this only shows one of them.
+  function apply() {
+    var b = box && box.checked ? 'x' : 'all', r = runner();
+    document.querySelectorAll('.view').forEach(function (v) {
+      v.hidden = v.getAttribute('data-budget') !== b || v.getAttribute('data-runner') !== r;
+    });
+  }
   // Storage can be unavailable (private window, file:// in some browsers);
-  // the switch still works, it just isn't remembered.
-  try { box.checked = localStorage.getItem(KEY) === '1'; } catch (e) {}
+  // the switches still work, they just aren't remembered.
+  try {
+    if (box) box.checked = localStorage.getItem(BUDGET) === '1';
+    var saved = localStorage.getItem(RUNNER);
+    radios.forEach(function (r) { if (r.value === saved) r.checked = true; });
+  } catch (e) {}
   apply();
-  box.addEventListener('change', function () {
+  if (box) box.addEventListener('change', function () {
     apply();
-    try { localStorage.setItem(KEY, box.checked ? '1' : '0'); } catch (e) {}
+    try { localStorage.setItem(BUDGET, box.checked ? '1' : '0'); } catch (e) {}
+  });
+  radios.forEach(function (r) {
+    r.addEventListener('change', function () {
+      apply();
+      try { localStorage.setItem(RUNNER, runner()); } catch (e) {}
+    });
   });
 })();
 """
@@ -798,45 +943,79 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
     ci_weeks = _axis([week_start(r["created_at"]) for r in runs])
     local_weeks = _axis([week_start(b["ts"]) for b in builds])
     workflows = _top_workflows(runs)
+    # The hosted/self-hosted views only appear once a self-hosted runner has
+    # been used: on a hosted-only project they would be one bar and no table.
+    self_hosted = any(minutes.runner_where(j["runner"]) == minutes.SELF_HOSTED for j in jobs)
 
-    def ci_view(suffix: str, view_runs, view_jobs,
-                exclude_budget: bool) -> tuple[dict[str, Chart], str]:
-        """The CI charts the budget switch changes, plus the reasons table.
+    def ci_view(suffix: str, view_runs, view_jobs, exclude_budget: bool,
+                where: str | None, weeks: list[str]) -> tuple[dict[str, Chart], str]:
+        """The CI charts the switches change, plus the reasons table.
 
         The table sits right under "Failures by job": the chart says which
         job, the table says what went wrong in it.
         """
         view = {
-            f"c1{suffix}": ci_duration_chart(f"c1{suffix}", view_runs, ci_weeks, workflows),
-            f"c2{suffix}": ci_p90_chart(f"c2{suffix}", view_runs, ci_weeks, workflows),
-            f"c3{suffix}": ci_queue_vs_exec_chart(f"c3{suffix}", view_runs, ci_weeks),
+            f"c1{suffix}": ci_duration_chart(f"c1{suffix}", view_runs, weeks, workflows),
+            f"c2{suffix}": ci_p90_chart(f"c2{suffix}", view_runs, weeks, workflows),
+            f"c3{suffix}": ci_queue_vs_exec_chart(f"c3{suffix}", view_runs, weeks),
             f"c4{suffix}": ci_minutes_chart(f"c4{suffix}", view_jobs),
-            f"c5{suffix}": ci_failure_rate_chart(f"c5{suffix}", view_runs, ci_weeks, workflows),
-            f"c6{suffix}": ci_flaky_jobs_chart(f"c6{suffix}", conn, project, exclude_budget),
+            # Hosted against self-hosted, so only where both are in view.
+            **({f"cw{suffix}": ci_where_chart(f"cw{suffix}", view_jobs)}
+               if self_hosted and where is None else {}),
+            f"c5{suffix}": ci_failure_rate_chart(f"c5{suffix}", view_runs, weeks, workflows),
+            f"c6{suffix}": ci_flaky_jobs_chart(f"c6{suffix}", conn, project, exclude_budget, where),
         }
         html = "".join(c.html for c in view.values()) + ci_failure_reasons(
-            conn, project, repo, exclude_budget, f"failures{suffix}")
+            conn, project, repo, exclude_budget, f"failures{suffix}", where)
         return view, html
 
-    all_charts, ci_section = ci_view("", runs, jobs, False)
-    summary = _summary(runs, builds, jobs)
-    toggle = ""
-
     # A run GitHub refused to start is a failure in the API, a ~3 second
-    # "build" in the timings and a minute per job in CI minutes. The second view is the same page without them:
-    # same weeks, same workflows and colours, so the two compare directly.
+    # "build" in the timings and a minute per job in CI minutes; a run on a
+    # self-hosted runner is timed on a different machine. So the page is
+    # rendered once per combination of the two switches, with the same
+    # workflows and colours, and the switches only choose which one shows.
     blocked = db.budget_blocked_runs(conn, project)
-    if blocked:
-        kept = [r for r in runs if r["run_id"] not in blocked]
-        kept_jobs = [j for j in jobs if j["cause"] != db.BUDGET]
-        x_charts, x_section = ci_view("x", kept, kept_jobs, True)
-        all_charts.update(x_charts)
-        ci_section = (f'<div class="view-all">{ci_section}</div>'
-                      f'<div class="view-x">{x_section}</div>')
-        summary = (f'<div class="view-all">{summary}</div>'
-                   f'<div class="view-x">{_summary(kept, builds, kept_jobs, stored=len(runs))}</div>')
-        toggle = _budget_toggle(len(runs) - len(kept))
+    run_where = {run_id: where for run_id, (_, where) in minutes.runs_where(jobs).items()}
+    runner_views = [("all", "", None)]
+    if self_hosted:
+        runner_views += [("hosted", "h", minutes.HOSTED), ("self", "s", minutes.SELF_HOSTED)]
+    budget_views = [("all", "", False)] + ([("x", "x", True)] if blocked else [])
+    single = len(runner_views) * len(budget_views) == 1
 
+    all_charts: dict[str, Chart] = {}
+    ci_section = summary = ""
+    for runner_key, runner_suffix, where in runner_views:
+        if where is None:
+            r_runs, r_jobs = runs, jobs
+        else:
+            # A run with no job detail is older than the job window or never
+            # got a runner; it counts as hosted (see _runner_toggle).
+            r_runs = [r for r in runs if run_where.get(r["run_id"], minutes.HOSTED) == where]
+            r_jobs = [j for j in jobs if minutes.runner_where(j["runner"]) == where]
+        # The hosted view keeps the full axis so it lines up with All; the
+        # self-hosted one would be months of nothing before its first run.
+        weeks = (_axis([week_start(r["created_at"]) for r in r_runs])
+                 if where == minutes.SELF_HOSTED else ci_weeks)
+        for budget_key, budget_suffix, exclude in budget_views:
+            v_runs = [r for r in r_runs if r["run_id"] not in blocked] if exclude else r_runs
+            v_jobs = [j for j in r_jobs if j["cause"] != db.BUDGET] if exclude else r_jobs
+            default = where is None and not exclude
+            charts_, section = ci_view(runner_suffix + budget_suffix, v_runs, v_jobs,
+                                       exclude, where, weeks)
+            stats = _summary(v_runs, builds, v_jobs, stored=None if default else len(runs))
+            all_charts.update(charts_)
+            if single:
+                ci_section, summary = section, stats
+                continue
+            div = (f'<div class="view" data-budget="{budget_key}" data-runner="{runner_key}"'
+                   f'{"" if default else " hidden"}>')
+            ci_section += f"{div}{section}</div>"
+            summary += f"{div}{stats}</div>"
+    toggle = (_runner_toggle() if self_hosted else "") + (
+        _budget_toggle(len(blocked)) if blocked else "")
+
+    if self_hosted:
+        ci_section += ci_runner_comparison(jobs)
     all_charts["c7"] = ci_slow_steps_chart("c7", conn, project)
     ci_section += all_charts["c7"].html
     all_charts.update({
@@ -856,6 +1035,11 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
         if ask and ask.get("available") else "null"
     )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ci_note = "Cold, clean-checkout hosted runners."
+    if self_hosted:
+        ci_note = ("Cold, clean-checkout hosted runners, and since it was first used a self-hosted "
+                   "runner too. The duration and queue charts count runs from both, so a shift "
+                   "there can be the machine rather than the build.")
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -871,7 +1055,7 @@ def render(conn: sqlite3.Connection, project: str, analysis: dict | None = None,
 {_ask_panel(ask)}
 
 <h2>GitHub Actions</h2>
-<p class="section-note">Cold, clean-checkout hosted runners.</p>
+<p class="section-note">{ci_note}</p>
 {ci_section}
 
 <h2>Local Gradle builds</h2>
@@ -885,7 +1069,7 @@ produces a comparison that looks meaningful and is not.</p>
 <div id="tip" role="tooltip"></div>
 <script>window.BUILDLOOP={blob};</script>
 <script>{_TOOLTIP_JS}</script>
-<script>{_BUDGET_JS}</script>
+<script>{_VIEW_JS}</script>
 <script>window.BUILDLOOP_ASK={ask_cfg};</script>
 <script>{_ASK_JS}</script>
 </body></html>

@@ -15,6 +15,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import minutes
+
 SCHEMA_VERSION = 4
 
 #: ``ci_failure.cause`` for a job GitHub refused to start because an Actions
@@ -300,8 +302,12 @@ def knock_on(r: sqlite3.Row, run: list[sqlite3.Row]) -> bool:
 
 
 def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
-                   exclude_budget: bool = False) -> dict:
+                   exclude_budget: bool = False, where: str | None = None) -> dict:
     """Diagnosed failures since ``since``, grouped by what went wrong.
+
+    ``where`` keeps only the failures of jobs on that kind of runner
+    (``minutes.HOSTED`` or ``minutes.SELF_HOSTED``). Knock-ons are still
+    judged against every job of the run, whichever runner it was on.
 
     ``exclude_budget`` leaves out jobs GitHub never started for want of
     budget; they are counted under ``budget`` either way.
@@ -322,7 +328,7 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
     unhappy = conn.execute(
         """
         SELECT j.job_id, j.run_id, j.run_attempt, j.name AS job, j.conclusion,
-               j.started_at, j.completed_at,
+               j.started_at, j.completed_at, j.runner,
                f.job_id AS diagnosed, f.step, f.reason, f.signature, f.excerpt, f.cause
         FROM ci_job j LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.conclusion IN ('failure', 'cancelled', 'timed_out')
@@ -331,7 +337,8 @@ def failure_groups(conn: sqlite3.Connection, project: str, since: str, *,
         """,
         (project, since),
     ).fetchall()
-    failed = [r for r in unhappy if r["conclusion"] == "failure"]
+    failed = [r for r in unhappy if r["conclusion"] == "failure"
+              and (where is None or minutes.runner_where(r["runner"]) == where)]
 
     by_run: dict[int, list[sqlite3.Row]] = {}
     for r in unhappy:

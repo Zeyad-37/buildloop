@@ -34,6 +34,12 @@ LINUX, WINDOWS, MACOS, SELF_HOSTED, OTHER = "Linux", "Windows", "macOS", "self-h
 #: first, so the expensive bands sit on top of the stack.
 OS_ORDER = (LINUX, WINDOWS, MACOS, SELF_HOSTED, OTHER)
 
+#: Where a job or a run ran. A hosted runner is anyone else's machine, billed
+#: by the minute; a self-hosted one is your own. A run is mixed when its jobs
+#: were split between the two.
+HOSTED, MIXED = "hosted", "mixed"
+WHERE_ORDER = (HOSTED, SELF_HOSTED, MIXED)
+
 
 def runner_os(runner: str | None) -> str:
     """Classify a ``ci_job.runner`` value (comma-joined labels).
@@ -54,6 +60,29 @@ def runner_os(runner: str | None) -> str:
     return OTHER
 
 
+def runner_where(runner: str | None) -> str:
+    """Hosted or self-hosted, from a ``ci_job.runner`` value.
+
+    Anything without the ``self-hosted`` label counts as hosted, third-party
+    runner services included: GitHub adds that label to every self-hosted
+    runner, so its absence is the reliable half of the test.
+    """
+    return SELF_HOSTED if runner_os(runner) == SELF_HOSTED else HOSTED
+
+
+def runs_where(rows: Iterable[sqlite3.Row]) -> dict[int, tuple[str, str]]:
+    """Each run in ``rows`` (from ``jobs``) as ``(first job start, where)``.
+
+    Decided by the jobs that used a runner, which is all ``jobs`` returns: a
+    skipped job carries the label it asked for but never ran anywhere.
+    """
+    seen: dict[int, tuple[str, set[str]]] = {}
+    for r in rows:  # oldest first, so the first row of a run is its start
+        seen.setdefault(r["run_id"], (r["started_at"], set()))[1].add(runner_where(r["runner"]))
+    return {run_id: (start, MIXED if len(kinds) > 1 else next(iter(kinds)))
+            for run_id, (start, kinds) in seen.items()}
+
+
 def billed(duration_ms: int | None) -> int:
     """Whole minutes for one job: rounded up, as GitHub bills it."""
     if not duration_ms or duration_ms <= 0:
@@ -71,7 +100,8 @@ def jobs(conn: sqlite3.Connection, project: str, since: str | None = None) -> li
     """
     return conn.execute(
         """
-        SELECT j.started_at, j.duration_ms, j.runner, r.workflow, f.cause
+        SELECT j.run_id, j.name, j.conclusion, j.started_at, j.duration_ms, j.runner,
+               r.workflow, f.cause
         FROM ci_job j JOIN ci_run r ON r.run_id = j.run_id
         LEFT JOIN ci_failure f ON f.job_id = j.job_id
         WHERE j.project = ? AND j.duration_ms > 0 AND j.started_at >= ?
@@ -82,20 +112,25 @@ def jobs(conn: sqlite3.Connection, project: str, since: str | None = None) -> li
 
 
 def totals(rows: Iterable[sqlite3.Row]) -> dict[str, Any]:
-    """Minutes in ``rows``: overall, by runner OS and by workflow.
+    """Minutes in ``rows``: overall, by runner OS, by where they ran and by
+    workflow.
 
-    Both breakdowns are sorted largest first, and an OS with no minutes is
+    The breakdowns are sorted largest first, and an OS with no minutes is
     left out rather than reported as zero.
     """
     by_os: dict[str, int] = {}
+    by_where: dict[str, int] = {}
     by_workflow: dict[str, int] = {}
     for r in rows:
         n = billed(r["duration_ms"])
         os_ = runner_os(r["runner"])
         by_os[os_] = by_os.get(os_, 0) + n
+        where = runner_where(r["runner"])
+        by_where[where] = by_where.get(where, 0) + n
         by_workflow[r["workflow"]] = by_workflow.get(r["workflow"], 0) + n
     return {
         "total": sum(by_os.values()),
         "by_os": dict(sorted(by_os.items(), key=lambda kv: -kv[1])),
+        "by_where": dict(sorted(by_where.items(), key=lambda kv: -kv[1])),
         "by_workflow": dict(sorted(by_workflow.items(), key=lambda kv: -kv[1])),
     }

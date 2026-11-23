@@ -192,6 +192,7 @@ def _minutes(conn: sqlite3.Connection, project: str, recent: str, prior: str) ->
         out[label] = {
             "total": mins(t["total"]),
             "by_runner_os": {k: mins(v) for k, v in t["by_os"].items()},
+            "hosted_vs_self_hosted": {k: mins(v) for k, v in t["by_where"].items()},
             "top_workflows": {k: mins(v) for k, v in list(t["by_workflow"].items())[:5]},
         }
     return out

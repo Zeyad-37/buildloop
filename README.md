@@ -109,9 +109,11 @@ that looks meaningful and is not.
 | Run duration (p90) per workflow | Is it getting less predictable? |
 | Queue time vs execution time | Is it us, or is it GitHub? |
 | CI minutes per week, by runner OS | How much runner time is CI using? |
+| Where CI ran: runs per week, hosted vs self-hosted | How much of CI is on my own machine? |
 | Failure rate per week | Is CI getting flakier? |
 | Failures by job (90d) | *Which* job is the flaky one? |
 | Why CI fails (90d) | *What* went wrong — the error from each failed job's log, grouped |
+| Same job, hosted vs self-hosted (90d) | Is my own runner faster, job by job? |
 | Slowest steps (90d) | *Where* inside that job? |
 
 When GitHub refuses to start a job because an Actions budget or spending limit
@@ -120,6 +122,16 @@ project has any, a switch at the top of the page — **Exclude runs blocked by t
 Actions budget** — shows every CI figure without them. They are recognised from
 the job's annotation, so only within the 90 days jobs are read for; the first
 refresh after upgrading re-reads the affected jobs once.
+
+Once a job has run on a runner carrying GitHub's `self-hosted` label, the page
+gains a **Runners** switch — All, Hosted, Self-hosted — that shows every CI
+figure except Slowest steps for runs on one kind of runner or for both
+together, along with the two hosted vs self-hosted views above. Anything
+without that label, third-party runner services included, counts as hosted.
+Where a run ran is read from its jobs, so runs older than the 90 days jobs are
+read for count as hosted, and a run whose jobs were split between the two is
+only under All. The CI minutes figure also says how many of its minutes were
+self-hosted, which GitHub does not bill.
 
 **Local Gradle**
 

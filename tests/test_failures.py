@@ -371,13 +371,13 @@ class TestBudget(DbCase):
         self.add_job(2, 2, "build", 50, 40, conclusion="success")
         page = dashboard.render(self.conn, "p")
         self.assertNotIn('id="budget-x"', page)
-        self.assertNotIn('class="view-x"', page)
+        self.assertNotIn('class="view"', page)
 
         self.add_blocked(1, 1, "build", 60, 59)
         page = dashboard.render(self.conn, "p")
         self.assertIn('id="budget-x"', page)
         self.assertIn("1 run failed without starting", page)
-        everything, excluded = page.split('<div class="view-x">')[:2]
+        everything, excluded = page.split('<div class="view" data-budget="x" data-runner="all" hidden>')[:2]
         # The summary is the first pair of views: one failure in two runs, or none in one.
         self.assertIn("50%", everything)
         self.assertNotIn("50%", excluded.split("</dl>")[0])
@@ -396,7 +396,7 @@ class TestBudget(DbCase):
             "runner": "ubuntu-latest", "run_attempt": None,
         })
         page = dashboard.render(self.conn, "p")
-        everything, excluded = page.split('<div class="view-x">')[:2]
+        everything, excluded = page.split('<div class="view" data-budget="x" data-runner="all" hidden>')[:2]
         tile = '<dt>CI minutes</dt><dd>'
         self.assertIn(tile + "13 min", everything)
         self.assertIn(tile + "10 min", excluded)
